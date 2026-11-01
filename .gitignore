@@ -1,0 +1,33 @@
+node_modules/
+dist/
+.shots/
+.chrome-profile/
+
+# 开发期临时产物
+*.log
+# 五个单测各自的 tsc 输出目录（注意：这些目录**没法由脚本自己删干净** ——
+# 环境里的 safe-delete 层会拦「文件数 > 50」的 rmSync，而 parse/protocol 一次就编出 55/56 个文件）
+#
+# 同一层还有一条**按回合累计**的额度：一个回合里删得多了，`npm run build` 的
+# 「清空 dist」也会被拦（报 SAFE_DELETE_BULK_CONFIRM_REQUIRED）。所以
+# 「先跑几个单测、再构建」这个顺序会翻车 —— 要么先构建，要么手动清掉 dist。
+.tmp-unit/
+.tmp-unit-parse/
+.tmp-unit-protocol/
+.tmp-args/
+.tmp-consist/
+vite.config.ts.timestamp-*.mjs
+tsconfig.tsbuildinfo
+
+# ==== 上传 GitHub 前补充（2026-11-01）====
+# 全部开发期临时目录：.tmp-ai-config / .tmp-consist / .tmp-probe / .tmp-wiki / .tmp-wikitext ...
+.tmp-*/
+# 开发期日志（.dev/ 下的 log 一并挡掉）
+.dev/*.log
+
+# 私人文件：绝不入库、绝不上传
+想要聊天的内容，agent请勿阅读.txt
+
+# WorkBuddy 本地工具数据（会话记忆、缓存），不属于项目源码；
+# 记忆的归档副本已在「文档归档/记忆文件/」里
+.workbuddy/

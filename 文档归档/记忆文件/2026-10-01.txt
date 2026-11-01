@@ -1,0 +1,176 @@
+# 2026-10-01
+
+## 编年：治「闪烁的插入点」+ 点轨选中卡片（架构澄清，未大改）
+
+作者拿了 Matrees 的参考文件（`原初宇宙 - 时间线&事件 - Matrees`），问了一串「能不能像真 wiki 那样
+卡片插图片/背景、条目支持图音视频表格」—— 先澄清：**这些几乎都已经有了**，不必大改架构。
+
+### 已有的（不用动）
+- **封面图**：`Entry.cover`（一条 `Piece` 的 id 引用，媒体属于整个世界、条目只引用）。
+  `ChronicleView` 里已实现两种画法（`coverMode: 'block' | 'bg'`，在「显示」浮层切）：
+  嵌入 = 卡顶加一截（`COVER_H=132`）；垫底 = 铺满整卡 + 半透明蒙层。
+- **条目富媒体**：正文走 Markdown，`![说明](asset:ID)` 嵌入图片/音频/视频（`MarkdownView`
+  渲染后补 `<img>/<audio>/<video>`），表格也有（`markdown.ts` 的 GFM 表格解析）。
+- **选图三来源**：`MediaPicker` 已经支持「上传 / 本条目的 / 世界的」，上传走 `createPiece`
+  进杂物间（留痕、可撤销、同文件不存两份），插入语法 `![标题](asset:ID)`。
+- **点下方的段/点跳上方**：`revealCard` 本来就按卡片实际左端平滑滚过去（轨钉真实位置、
+  卡会就地铺开，两者坐标会差开，所以滚的是卡）。
+
+### 本轮真改的两处（都小）
+1. **闪烁的插入点** = `.chron-item` 没禁选字。卡片可拖，按下时浏览器开始文本选择，
+   标题上冒出 I 形光标跟着指针走（JS 里 `preventDefault` 只掐了拖拽选字，点一下仍会选中）。
+   给 `.chron-item` / `.chron-node` / `.chron-bar` 各加 `user-select: none`（`.chron-bar-name`
+   本来就 `pointer-events: none`，不用加）。
+2. **点轨上的点/段 → 选中卡片**：`revealCard` 原来只滚不选，右栏注记停在旧条目上，上下仍对不上。
+   加一行 `setSelId(id)`，点下方的段/点，上面的卡滚到眼前**且右栏跟着切到它**。
+
+### 验证
+- `e2e-chronicle.mjs` 48 → **50**（新增：卡片/轨点/轨条都 `user-select:none`；
+  点轨上的点 → `chron-panel` 的 `data-id` 与点的一致）。
+- 回归：`e2e-timeline` 135/135、`e2e-graph` 58/58；`typecheck` ✓、`unit-prompts` 21/21、
+  `unit-args` 60/60、`unit-agent-prompt` 4/4。
+
+### 备注（与本次无关、既有的）
+- `i18n-coverage` 报 `ReviewPage.tsx:499` 的 `：`（全角冒号）疑似硬编码 —— 是 `t()` 后面的
+  合法标点，扫描器误报，非本轮引入，暂未处理。
+
+---
+
+## 导出设定集：内链转真实可跳转链接 + HTML 重写
+
+作者原话：「导出后打开文件点击某个引用目录后确实会跳转」「现在的文本会保留 [[ ]] 这个特殊格式显得很丑」。
+
+### 根因
+- `buildMarkdown` 里 `includeInternalLinks=true` 时**原样保留 `[[条目]]`**（丑，且不是真链接）；
+  `=false` 时才剥成纯文字。目录 TOC 是纯文本 `- 标题`，不跳。关系/大事记的 `relOut`/`relIn`/
+  `timelineLinked` 把 `[[{title}]]` **写死在 i18n 里**。
+- `buildHtml` 用一串正则草率转 markdown，**丢表格、丢媒体、丢内链、标题无锚点** —— 根本点不回去。
+
+### 改法（`src/lib/export.ts`）
+- 新增 `anchorOf(title)`：小写 → 去标点（`[^\p{L}\p{N}\s_-]`）→ 空格折 `-`，**中文照原样留**，
+  与 GitHub/Typora/Obsidian 的标题自动锚点规则一致（别处打开 .md 链接照样对得上）。
+- `buildAnchorMap(entries)`：标题 → 唯一锚点，重名补 `-2`/`-3`。
+- `linkify(content, map, md, links)`：`[[条目]]` / `[[条目|显示]]` → `[显示](#锚点)`（md）或
+  `<a href="#锚点">`（html）；找不到锚点退化成纯文字（不编会点空的链接）；`links=false` 走 `stripWikiLinks`。
+- Markdown：目录 `- [标题](#锚点)`、关系/大事记引用都折成 `[标题](#锚点)`，正文走 `linkify`。
+- HTML：整段重写为**结构化生成**——页头 meta、目录（`<a href="#锚点">`）、大事记、分类条目。
+  每个标题 `<h3 id="锚点">`；正文复用 `renderMarkdown`（表格/粗斜体/代码块/媒体占位都全），
+  再把 `[[x]]` 的 `<span class="wl">` 换成 `<a href="#锚点">`、把 `asset:ID` 的 `md-asset` 占位
+  换成 `<img>/<audio>/<video>`（Blob 内联成 dataURL，导出的 .html 离了库也打得开）。
+- `buildHtml` 从同步改 **async**（媒体要 Blob→dataURL），签名多一个 `pieces`；`ExportPage` 的
+  下载按钮改成 `await buildHtml(..., store.pieces)`。
+- i18n：`relOut`/`relIn` 去掉写死的 `[[ ]]`（链接改由代码拼）；新增 `lib.export.html.metaItem` /
+  `tocCount` / `metaSep` / `colon` 四个 HTML 专用格式串（把 `：`、`（）`、`　` 这些结构标点
+  收进文案，免得被 i18n 覆盖扫描当硬编码报）。zh/en 同步。
+
+### 验证
+- 新增 `.dev/unit-export.mjs`（29 项）：`anchorOf` 边界（中文保留/标点剥离/空标题）+ `buildMarkdown`
+  /`buildHtml` 的锚点、内链折对、无残留 `[[ ]]`、失效媒体如实标出。
+- `e2e-timeline.mjs` 135 → **137**：改掉旧断言 `seg.includes('[[守灯人]]')`（那是被用户点名的旧行为），
+  换成 `[守灯人](#守灯人)` + 全篇无 `[[...]]` + 目录是真链接。
+- 全绿：`typecheck`、`i18n-coverage`（69 源文件）、`unit-export` 29/29、其余单测、`e2e-timeline` 137/137。
+
+### 坑
+- Node 里没有 `FileReader`（浏览器 API），所以媒体 dataURL 内联**在 Node 单测里验不了**，只能靠
+  浏览器端验证；单测只验「失效媒体如实标出」这条不依赖 FileReader 的路径。
+- `linkify` 一开始 `if (!links) return content` 是错的（links=false 应剥纯文字，不是原样返回），
+  改回 `stripWikiLinks`。
+
+### 修复：新建世界「答完接着聊」丢失上一轮问答（遗忘式重问）
+- **根因**：`buildIntakePrompt`（`src/ai/prompts.ts`）收了 `params.answers` 却从没渲染进 user 提示词。
+  `intakeUser` 模板里只有 `{materials}` / `{toldBlock}` / `{extraBlock}` / `{task}`，唯独没有问答块；
+  于是模型拿到「作者已经回答了上面的问题」这句空话，却看不到问题原文和答案 → 又把刚答过的问题问一遍。
+- **修法**：`intakeUser`（zh/en）加 `【与作者的问答】{qa}` 占位；`buildIntakePrompt` 补 `qa: renderQa(params.answers)`。
+  `renderQa` 空时输出「（还没有问答记录）」，非空逐条 `问/答`，「你来定」标成「作者授权」。
+- 「够了直接写草案」的 `doProposal` 本来就正确带了 `qa`+`told`，无需改 —— 是 continue 分支漏的。
+- 回归测试：`.dev/unit-prompts.mjs` 加 4 条 intake 断言（followUp 带问答原文/答案/你来定；首轮空占位），
+  21 → 25 项全绿。
+- 验证：`typecheck`、`i18n-coverage`（69 源文件）、`unit-prompts` 25/25。
+
+---
+
+## 编年/时间轴：时间锁定 + 「AI 行为」菜单（排版 + 猜时间）
+
+作者原话：「默认新增一个锁定，让轴上的位置和其时间是锁定在一起的…ai自动排版数轴变化一下，
+将其作为『ai行为』的子菜单中的一条，第二条命令是ai自动根据设定猜测条目的时间并且设定好…
+先进审查，以一张卡片展示…都可以让 ai工作台的对话窗口改」。
+
+### 锁定（`EntryTime.locked`，默认 true）
+- **纯函数地基** `src/lib/timeParse.ts`：`parseTimeText`（"120 年"→120、"120 年 6 月"→120.5、
+  "前 3 年"→-3、纯数字、非解析纪元→null）、`formatTimeText`（数字→"120 年 6 月"）、`monthOfValue`。
+- **双向联动**：`store.setEntryTime` 里，锁定条目「改 `at` 没动 `from`」→ 用 `formatTimeText` 重写 `from`；
+  「改 `from`」→ `normTime` 用 `parseTimeText` 重算 `at`。只认**本次显式传的字段**，不拿旧值互相覆盖。
+- `formatTimeText` 里的中文「年/月/前」是**世界内纪年数据格式**（语言无关），加 `// i18n-allow` 说明。
+
+### 「AI 行为」总菜单
+- 编年 `ChronicleView` 与时间轴 `TimeAxis` 都加了同一套下拉：`data-role="{chron,tl}-ai-toggle"` 点开 →
+  `{chron,tl}-ai-layout`（原「AI 自动排版」）+ `{chron,tl}-ai-guess`（猜时间）。样式 `.chron-ai-*`。
+- 两个入口共用 `useTimelineLayout` / 新增 `useTimelineGuess`（sister hook，过滤已有时刻条目后入队）。
+
+### 猜时间（`timeline-guess`）
+- 复用 `TimeLayoutItem` 结构，`ReviewItem` 新增 `guessDraft?`；`ReviewKind` 加 `'timeline-guess'`。
+- `runTimelineGuess`（`src/ai/tasks.ts`）拆轴/池，调 `buildTimelineGuessPrompt`，强制每行带 `from` 文本。
+- `store.acceptReview` 的 guess 分支：跳过**这期间已有时刻**的条目，逐条 `setEntryTime`（from+at 一起）。
+- **审查页一张卡**：`ReviewPage` 把 layout/guess 统一渲染成一张表（guess 多「定成什么时候」栏）。
+- **本轮收尾**：`EditLayout` 改成 draft-agnostic（guess 读 `guessDraft`、多一栏可改 `from` 文本），
+  「改一改再采纳」两条路径都走它；路由 `editing.kind` 分支把 `timeline-guess` 也送进 `EditLayout`。
+  i18n 新增 `review.guess.editTitle/editHint/editWhen`。
+
+### agent 工具
+- `AGENT_TOOLS` 新增 `layout_timeline` / `guess_timeline`（`risk:'write'`、无参数、纯触发），
+  调 `runTimelineLayout`/`runTimelineGuess` 后 `propose` 进审查队列，绝不直接落库。
+
+### 验证
+- 新增 `.dev/unit-timeparse.mjs` 18/18；`typecheck` ✓、`i18n-coverage` 71 源文件、`unit-prompts` 25/25、
+  `unit-args` 60/60、`unit-agent-prompt` 4/4、`build` ✓。
+- **e2e 按钮结构变更**：`e2e-chronicle.mjs` / `shot-chron.mjs` / `e2e-timeline.mjs` 里原来直接点
+  `{chron,tl}-ai-layout` 的，都补了先点 `-ai-toggle` 打开菜单再点二级命令；timeline 那段还加了
+  「点完菜单收起 → 再点开看 disabled 态」的改法（因为点完 layout 菜单会关、按钮卸载）。
+- 注意：e2e 若跑失败，先查是不是 `__mock-stats` 跨脚本累加污染（见 MEMORY 第 23 条）。
+
+---
+
+## 双向关系：图上合并成双箭头 + 关联处显示双方
+
+作者原话：「如果联系是双方都存在的，请自动合并成一个双箭头在关系图里，同时也在关联处
+修改一下，显示一下双方的关系」。
+
+### 核心设计：归并只是**展示层**的事
+- 新增 `src/lib/relations.ts`（纯逻辑层）：`mergeMutual(relations)` 把互为反向的一对
+  （A→B 且 B→A）合成一个 `MergedRel`（`{rels, mutual}`）；`mergeMutualOf(entryId, …)`
+  从条目视角归并（双向时 rels[0] 恒为「我出发」那条）。底层仍是两条独立 `Relation`，
+  type/note/status 各改各的，**没有动数据模型**。
+- 恰好两条反向才合并；同向两条、三条同对都不并（宁可各算各的，不猜）。
+- 排序归一：`from` 字典序小的排前 + 稳定排序，结果不因遍历顺序漂移。
+
+### 图谱页（GraphPage）
+- `mergedLinks = mergeMutual(links)`：**弹簧、度（圆大小）、连线渲染**都按归并后的边走
+  （一对反向只拉一根弹簧、圆只算一份）—— 概览里「连线数」仍数原始关系（那是数据量）。
+- 双向边：`markerStart` + `markerEnd` 双箭头（marker 本来就是 `orient="auto-start-reverse"`，
+  直接复用）；标签两个方向各一句 `敌对 ⇄ 效忠`（相同则只写一个）；任一方向 hot 整条边 hot。
+- `data-link` 仍取 rels[0] 的 id（老 e2e 选择器不受影响），另加 `data-mutual="true"`。
+- 待定关系照旧：一对里任一是 pending，整条边按虚线黄画。
+
+### 关联处（三处全改）
+- **图谱侧栏 EntryQuickPanel**：`mergeMutualOf` 归并，双向行方向显示 `⇄`、回来那条的类型
+  摆在行尾（`.gx-rel-back`），删除按钮一次删一对（单向照旧删一条）。
+- **条目编辑器 EntryEditor 关系 tab**：双向合并成一行，标签写「互相」，回来那条的类型
+  摆成第二颗 pill，删除按钮删一对。
+- **Wiki 阅读侧栏**：`relatedTo` 直接在返回值里归并（`RelatedEntry` 加可选
+  `mutual?: {type, note}`），句子渲染成「本条目 敌对 ⇄ 效忠 对端」；非双向路径完全不变。
+- **RelEditor**：点双向边编辑 rels[0] 时，加一行提示「还有反向的一条：{type}」
+  （`data-role="graph-rel-mutual-hint"`）—— 不然作者改了这边、回头看到那边没跟着变会以为丢了。
+
+### i18n
+- zh/en 同步新增：`graph.mutualSep`（' ⇄ '）、`graph.link.mutualHint`、
+  `entries.rel.mutual`（互相）、`entries.rel.mutualSep`、`wiki.read.mutual`、`wiki.read.mutualSep`。
+  （`⇄` 分隔符进了语言包，避免被 i18n 覆盖扫描当硬编码报。）
+
+### 验证
+- 新增 `.dev/unit-relations.mjs` 10/10（单向/双向/顺序无关/同向不误并/三条不并/视角归并/过滤）。
+- `e2e-graph.mjs` 58 → **65**：播种一对反向关系（敌对+效忠），断言——图上合并成一条边
+  （data-mutual）+ 双箭头（markerStart/markerEnd 都在）+ 标签两方向各一句；侧栏一行 + `⇄` +
+  两类型都可见（注意断言要读 `input.value`，`innerText` 里没有输入框的值）；RelEditor 提示反向那条。
+- 回归：`e2e-wiki` 58/58（测试数据无双向对，归并是 no-op）、`unit-wiki` 64/64、
+  `typecheck` ✓、`i18n-coverage` 73 源文件、`build` ✓、`unit-prompts` 25/25、`unit-args` 60/60。
+- 坑：测试脚本里 `indexedDB.open('worldforge')` **不要带版本号**（带旧版本号会升级失败打不开库）。

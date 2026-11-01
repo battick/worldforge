@@ -1,0 +1,85 @@
+# WorldForge 项目须知（速查·跨会话）
+
+个人世界观知识库。**单机优先**：Vite 5 + React 18 + TS strict + IndexedDB，**零额外运行时依赖**（只有 jszip /
+pdfjs-dist 解析文档）。注释/文档用中文，写「为什么」不写「做了什么」。
+
+> **四份记忆的分工**（§编号跨册连续）：
+> · **本文** = 跑法 + 数据层 + i18n 的核心铁律，每次会话**整份注入**，只记「要做什么 / 不许做什么」；
+> · **`MEMORY-ai.md`** = §3 AI 解析契约、§4 agent 循环、§5 任务队列 —— **改 AI 相关代码先读**；
+> · **`MEMORY-ui.md`** = §6 假上游与 e2e、§7 设置页、§8 界面与关键文件、§9 正文编辑器、§10 验证工具 ——
+>   **动到哪一块先读哪一节**；
+> · **`CASES.md`** = 每条背后的完整案例（症状、根因、当初怎么改的），需要时再读。
+> 日更日志 `YYYY-MM-DD.md`。
+
+## 跑法
+
+- 改完至少 `npm run typecheck` + `i18n-coverage.mjs` + `unit-prompts.mjs` + `unit-agent-prompt.mjs`。
+- 动了页面：`npm run build` → 起服务 → 跑对应 `.dev/e2e-*.mjs`（服务用 `run_in_background` + `dangerouslyDisableSandbox: true`：
+  `python -m http.server 5188 --directory dist --bind 127.0.0.1`、`node .dev/mock-upstream.mjs 5190 --cors`）。
+- **先构建、后跑单测**（safe-delete 额度按回合累计）。读本地端口一律 `curl --noproxy '*'`。
+- 改了 `mock-upstream.mjs` / `server.mjs` **必须重启进程**（不热加载）。
+
+## 1. i18n
+
+- 用户可见文字一律 i18n，**不引新依赖**。顺序：`zh/<模块>.ts` 加 key（**zh 是事实来源**）→ `en/<模块>.ts` → 才 `t()`。
+- `en` 每个模块文件顶上**必须**有 `const en: Record<keyof typeof zh, string> = {...}`（聚合层没有，守卫逐模块生效）。
+- **非 React 层**（`lib`/`ai`（除组件）/`storage`/`types.ts`）别 import `../i18n`（.tsx）→ 用 `i18n/translate` 的
+  `tGlobal`/`MsgKey`、`i18n/core` 的 `localeMeta`。
+- **只软编码、不改措辞**（逐字保留）。**e2e 断言原始中文** → 写断言前先 `grep` 语言包（`common.charCount` 是 `{n} 字`）。
+- 覆盖扫描会把 `ch === '｝'` 当硬编码中文报 → **抽成映射表**，别逐行 `// i18n-allow`。
+- `agent.sys.*` 的孤儿键 `grep` 查不出 → 靠 `unit-agent-prompt.mjs` 机器对（双向引用 + 中英逐键对齐）。
+- **删 key 要连多行值的值行一起删**（否则 `TS1005`）；删完跑 typecheck。
+- **动态拼的 key 会被孤儿键守卫当死键** → 改成**字面量表**（`ai.probe.state.*` 的 `STATE_KEY`）。
+
+## 2. 数据层 / store
+
+- **每个写操作都要 `logOp()`**（带撤销快照 `OpUndo`）；删类快照要含**连带删掉的子项**（删条目→关系；删分类→条目+关系）。
+  `undoOp()` 走底层 storage 直写、不产新日志；撤销「新建条目」还要清掉挂它上面的关系。
+- **store 写函数必须读 `dbRef.current`**，不能读渲染期闭包里的 `db`（会静默丢字段）。
+- **基于旧值算新值一律函数式写法**（同 tick 连点两次会覆盖第一次）。
+- **新增 store 要一次改六处**：`storage/types.ts` 的 `StoreName`+`STORE_NAMES` → `indexeddb.ts` 的 `DB_VERSION`
+  （**升一位**）→ `store.tsx` 的 `interface DB`/`EMPTY_DB`/`STORE_OF`/`deleteWorld` 快照（含 `groups`）→ `AGENT_PAGES`
+  类清单；`.dev/` 里写死版本号的脚本同步升版。`importBackup` 遍历 `STORE_NAMES`，自动跟。
+- **「资料入库」只有一条正道**：`store.addDoc()` 且填齐 `worldId/name/ext/size/text/parsed/addedAt`。
+- **迁移必须在独立 `useEffect` 触发**（`migrateTimeline` + `World.timelineMigratedAt` 闸门）。
+- **同一动作两个入口只留一个写函数**（时间轴拖入/点击都走 `placeAt(id, at)`）。
+- **按「分组」输出会重排历史，别做**（导大事记按 `at` 遍历、换段时才开新小节）。
+- **条目时间带 `locked`（默认 true）**：锁定=位置从 `from` 文本解析（`lib/timeParse.ts` 双向换算）；`setEntryTime`
+  双向联动（改 `at` 没 `from` → 重写文本；改 `from` → 重算 `at`）。详见 2026-10-01 日志。
+- **双向关系归并只是展示层**（`lib/relations.ts` 的 `mergeMutual`）：图/侧栏/编辑器/Wiki 四处共用；
+  图上度与弹簧按**归并后的边**算，底层仍是两条独立 `Relation`。
+
+### 2.1 `Entry.time`（`TimelineEvent` 已废，只作迁移来源）
+
+- **双写**：存原文 `from`/`to` + 数值 `at`/`toAt`（轴靠 `at`；`toAt` 可选：有→按比例实线，无→固定长虚线）。
+- **「按比例/均匀铺开」是画法**，切换不许动 `at`。
+- **形态显式三选一**（`kind: 'point'|'range'|'ongoing'`），**绝不靠「终点空不空」猜**。
+- **「没提时间」≠「去掉时间」**：`readTimeArgs` 返回 `undefined`=没提、`null`=明说去掉（只有 `clearTime`）。
+- **位置不给模型猜**（缺 `at`/`toAt` 由 `nextAt` 按轴末补齐）；写回走 `setEntryTime`，**不许塞进 `updateEntry` 的 patch**。
+- **落位只写位置、不编时间文本**（只有 `at` 没 `from` → 如实标「还没写下时间」）。
+
+## 3–5 —— 在 `MEMORY-ai.md`
+
+AI 解析与工具契约（§3）/ agent 循环（§4）/ AI 任务与队列（§5）。**改 AI 相关代码先读它**。
+跨界最要紧的三条：协议解析不许静默丢动作；「读不懂」不许冒充「没问题」；agent 写操作一律进审查队列。
+
+## 6–10 —— 在 `MEMORY-ui.md`
+
+界面 / e2e / 设置页 / 正文编辑器 / 验证工具这五节篇幅大（§6 假上游与 e2e 纪律、§7 设置页与接入厂商、
+§8 界面与关键文件含 **8.1 编年**、§9 正文编辑器、§10 验证工具与环境坑）。**动到哪一块就先读哪一节**
+（连同 `CASES.md` 的同号小节）。本节只记三条跨界的：
+- **e2e 三个前置**：跑前 `GET /__mock-stats/reset`（外加 `/__mock-delay`）归零；同一套 e2e 不许并发两轮；
+  `e2e-onboarding` 的假上游**不带** `--cors`，其余要带。
+- **界面两条通用的**：新增 CSS 类名先 `grep`（同名会让某个元素静默套上另一套样式）；判断「谁压住谁」要量
+  `getBoundingClientRect`，且包含判据只能按 DOM 父子、不能按矩形大小。
+- **截图/演示脚本**：不写死版本号；放大看细节用 `clip` + `captureBeyondViewport: true`，别缩视口。
+
+## 11. 当前环境（截至 2026-10-01）
+
+- `DB_VERSION = 5`；静态服务 5188、假上游 5190（`--cors`）常驻；跑 e2e 前先 `npm run build`。
+- e2e 基线：`e2e-graph` **65**（含双向关系 7 项）、`e2e-timeline` 137、`e2e-chronicle` 50、`e2e-wiki` 58、
+  `sweep` 16；单测：`unit-relations` 10（双向归并）、`unit-timeparse` 18（锁定换算）、`unit-prompts` 25、
+  `unit-args` 60、`unit-agent-prompt` 4。
+- **编年已是第一入口**（`#graph` 三支：关系 / 编年 / 旧的点轴）；时间锁定与「AI 行为」菜单（排版 + 猜时间）
+  已落地，详见 2026-10-01 日志。
+- 截图细节自检用 `.dev/crop.py`（Pillow，隔离 venv）裁放大图；`shot()` 一律带 `captureBeyondViewport: true`。

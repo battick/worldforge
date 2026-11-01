@@ -1,0 +1,469 @@
+# WorldForge · 功能与实现手册（含代码）
+
+> 版本：v0.2.0 · 技术栈：Vite 5 + React 18 + TypeScript(strict) + IndexedDB
+> 运行时依赖仅 `react` / `react-dom` / `jszip` / `pdfjs-dist`，其余全部自研。
+> 本手册按「功能模块」组织，每个模块讲清**做什么、怎么做的（代码层面）、涉及哪些文件**，供后续维护、升级、二次开发使用。
+
+---
+
+## 〇、总览：架构分层
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  UI 层（pages/ + components/）                            │
+│    Dashboard · Wiki · Graph · Studio · Review · Docs      │
+│    Consistency · Ask · Log · Article · Export · Settings │
+├─────────────────────────────────────────────────────────┤
+│  state 层（React 之外的模块级状态）                        │
+│    store.tsx（数据 + 撤销 + 写操作）                       │
+│    aiTasks.ts（单发 AI 任务表）  jobQueue.ts（串行队列）    │
+│    agentRunner.tsx（agent 常驻运行器）  useAgent.ts        │
+├─────────────────────────────────────────────────────────┤
+│  ai 层（与模型交互）                                       │
+│    client.ts（HTTP + SSE）  tasks.ts（各任务 run 函数）     │
+│    prompts.ts / promptText/*（提示词）  parse.ts（容错解析）│
+│    agent/{protocol,tools,prompts}.ts（内置 agent）         │
+│    providers.ts / models.ts / probe.ts / consist.ts       │
+├─────────────────────────────────────────────────────────┤
+│  storage 层（数据持久化，可替换）                           │
+│    types.ts（StorageAdapter 接口）                         │
+│    indexeddb.ts（LocalAdapter 默认实现）  rest.ts（云骨架） │
+├─────────────────────────────────────────────────────────┤
+│  lib 层（纯函数工具）                                       │
+│    id / timeParse / relations / wiki / export / markdown   │
+│    diff / text / files / images / autoLink / diagLog …    │
+└─────────────────────────────────────────────────────────┘
+```
+
+**贯穿全项目的四条铁律**（每个模块都受它们约束）：
+
+1. **AI 提议、人拍板**：所有 AI 产出先落「审查队列」（`review` store），采纳才写库。
+2. **单机优先**：默认 `LocalAdapter`（IndexedDB），数据不出本机；存储层做了抽象，未来换云端不改业务代码。
+3. **写操作必留撤销**：每次写入走 `logOp()` 记一条带 `OpUndo` 快照的操作日志，任何一步可回退。
+4. **任务状态活在组件外**：AI 任务与队列都是模块级状态，路由切换不中断。
+
+---
+
+## 一、数据模型（`src/types.ts`）
+
+所有实体带 `worldId`（多世界）、主键为 `id: string`（便于将来平移云端表结构）。核心实体：
+
+| 实体 | 说明 | 关键字段 |
+|---|---|---|
+| `World` | 世界（顶层容器） | `name/tagline/summary/genre/tone/themeColor`、`timelineMigratedAt` |
+| `Category` | 条目分类 | `name/icon/fieldDefs[]/color/order` |
+| `Entry` | 世界观条目（最小单元） | `key`（归一化唯一）、`aliases/tags/fields`、`status`、`time?`、`cover?` |
+| `Relation` | 条目关系 | `fromEntryId/toEntryId/type/note/status` |
+| `EntryTime` | 条目时间（非独立表） | `kind/from/to/at/toAt/era/weight/locked` |
+| `Piece` | 杂物间藏品 | `kind`（九种）、`media?/thumb?`、`linkedEntryIds` |
+| `SourceDoc` | 资料文件 | `name/ext/text/parsed` |
+| `ReviewItem` | 审查提议 | `kind`、`entryDraft/relationDraft/layoutDraft/guessDraft`、`source?` |
+| `OpLog` | 操作日志 | `actor/action/entity/target`、`undo`（撤销快照）、`undone` |
+| `ChatThread`/`ChatTurn` | agent 会话 | `turns[]`、`todos?`、每轮的 `calls/pending/stuck/suggest` |
+| `WorldDraft` | 新建世界草稿 | `stage`、`materials/questions/qa/proposal` |
+
+### 1.1 `EntryTime` 的「锁定」设计（时间轴核心）
+
+```ts
+export type EntryTimeKind = 'point' | 'range' | 'ongoing';
+export interface EntryTime {
+  kind: EntryTimeKind;
+  from: string;      // 给眼睛看的世界内纪年文本
+  to: string;        // 仅 range 有意义
+  at?: number;       // 给机器排序用的数值位置
+  toAt?: number;     // range 的终点位置
+  era: string;       // 纪元名
+  weight: TimeWeight; // 'major'|'normal'|'minor'
+  locked?: boolean;  // 默认 true：at 严格等于 from 文本解析值
+}
+```
+
+- **双写**：存原文 `from/to`（作者怎么写就怎么存）+ 数值 `at/toAt`（轴靠它排序）。
+- **锁定**：`locked` 时 `at === parseTimeText(from).value`。改文本→位置跟着走；改位置→文本跟着重写（`setEntryTime` 里 `formatTimeText`）。
+- **形态显式三选一**，绝不靠「终点空不空」猜。
+
+### 1.2 `ReviewItem` 的判别联合 `kind`
+
+```ts
+export type ReviewKind =
+  | 'create-entry' | 'update-entry' | 'delete-entry'
+  | 'relation' | 'update-relation' | 'delete-relation'
+  | 'consistency' | 'timeline-layout' | 'timeline-guess';
+```
+
+`ReviewItem.source?: ReviewSource` 记「这条提议当初是怎么生成的」，供审查页的「再生成」重跑：
+
+```ts
+export type ReviewSource =
+  | { task: 'generate'; categoryId; instruction; count; keywords; allowRelations }
+  | { task: 'polish'; targetEntryId; focus: PolishFocus[]; instruction }
+  | { task: 'relations' } | { task: 'timeline-layout' }
+  | { task: 'timeline-guess' } | { task: 'consistency' };
+```
+
+---
+
+## 二、存储层（`src/storage/`）
+
+### 2.1 抽象接口（`types.ts`）
+
+```ts
+export interface StorageAdapter {
+  readonly kind: 'local' | 'cloud';
+  readonly label: string;
+  readonly degradedReason?: string | null;
+  init(): Promise<void>;
+  getAll<T>(store): Promise<T[]>;
+  get<T>(store, id): Promise<T | null>;
+  put<T>(store, item): Promise<void>;
+  putMany<T>(store, items): Promise<void>;
+  remove(store, id): Promise<void>;
+  removeMany(store, ids): Promise<void>;
+  clear(store): Promise<void>;
+}
+```
+
+**升级预留**：`rest.ts` 里已有 `RestAdapter` 骨架。未来接云端只需实现同一接口、在 `index.ts` 切工厂，上层零改动。
+
+### 2.2 本地实现（`indexeddb.ts`）
+
+- 库名 `worldforge`，`DB_VERSION = 5`（每新增 store 升一位）。
+- 11 个 object store（`STORE_NAMES`）：`worlds/categories/entries/relations/docs/review/drafts/pieces/timeline/ops/chats`。
+- 非 `GLOBAL_STORES`（`worlds/drafts`）的 store 建 `worldId` 索引。
+- **打开策略**（关键，防僵尸请求饿死）：
+  - `init()` 先**不带版本号**打开（数据总能读到）；版本落后→先用旧连接干活，标记 `pendingUpgrade`；
+  - `finishUpgrade()` 在数据加载完成后后台升级，`patient` 模式等占用者关闭后自动完成；
+  - 超时（`OPEN_TIMEOUT_MS=12s`）不等于取消，迟到的幽灵连接立即 `close()` 防堵死。
+
+### 2.3 store 工厂（`index.ts`）
+
+```ts
+export function createStorage(): StorageAdapter {
+  // 当前固定返回 LocalAdapter；未来可据登录态/环境切 RestAdapter
+  return new LocalAdapter();
+}
+```
+
+---
+
+## 三、状态与写操作（`src/state/store.tsx`）
+
+这是全应用的**单一写入口**。`StoreProvider` 维护一份内存 `DB`（与 IndexedDB 同步），并通过 Context 暴露读写函数。
+
+### 3.1 内存副本 `dbRef`（防静默丢字段）
+
+```ts
+const dbRef = useRef<DB>(EMPTY_DB);
+const setDb = useCallback((updater) => {
+  const next = typeof updater === 'function' ? updater(dbRef.current) : updater;
+  dbRef.current = next;
+  setDbState(next);
+}, []);
+```
+
+**写函数一律读 `dbRef.current`**，不能读渲染期闭包里的 `db`——否则同 tick 连点两次，第二次会拿旧值覆盖第一次。
+
+### 3.2 操作日志与撤销（`logOp` / `undoOp`）
+
+```ts
+async function logOp(input: LogOpInput): Promise<OpLog> {
+  const full: OpLog = {
+    id: uid('op'), actor: actorRef.current, action: input.action,
+    entity: input.entity, target: input.target, undo: input.undo ?? null,
+    undone: false, sessionId: sessionRef.current, createdAt: now(),
+  };
+  setDb((d) => ({ ...d, ops: [full, ...d.ops].slice(0, OPS_CAP) })); // OPS_CAP = 800
+  await put('ops', full);
+  return full;
+}
+```
+
+`undoOp` 撤销时：`OpUndo.remove[]`（删掉新建出来的）、`OpUndo.restore[]`（写回改前/被删的完整对象）、`OpUndo.settings`（恢复设置快照）。**连带清理**：删条目→连它两端的关系；删分类→条目+关系；撤回待审提议→连带删挂在它上面的关系提议。
+
+### 3.3 `withActor`（区分谁做的）
+
+```ts
+withActor<T>(actor: 'user'|'agent', fn, sessionId?)
+  → 返回 { value, opIds }  // opIds 是作用域内新产生的日志 id
+```
+
+agent 调用 store 时用 `withActor('agent', …)`，日志里分清「作者点的」还是「agent 替他做的」。
+
+### 3.4 关键写操作（摘录核心）
+
+- `createEntry`：算 `key = entryKey(title)` → 同世界查重 → `time` 若给则 `normTime(data.time, nextAt(worldId))` → 写库 + `logOp`。
+- `setEntryTime(entryId, patch|null)`：**双向联动**（锁定条目改 `at` 没 `from` → `formatTimeText(at)` 重写文本）；`null` = 摘掉时间；缺 `at` 由 `nextAt` 补。
+- `nextAt(worldId, exceptId)`：找当前最大 `at`，+10 起步（留出往中间塞的余地）。
+- `acceptReview(id, override?)`：按 `kind` 分发落地，**逐条走 `setEntryTime`**（时间只此一个入口）；`create-entry` 自动带上依赖它的待审关系（`followIds`）；`relation` 若一端未落地→退回 `rejected` 并注明原因。
+- `deleteWorld`：连带删 `categories/entries/relations/docs/review/pieces/timeline/ops/chats`，撤销快照含全部子项。
+- `migrateTimeline(worldId)`：旧 `TimelineEvent` → 条目（正文=经过、`order`=位置、关联条目转关系），`timelineMigratedAt` 作闸门，独立 `useEffect` 触发。
+- `commitDraft(draft)`：把草稿的 `proposal` 正式落库（新建 `world` + `categories` + `entries` + `relations`）。
+- `importBackup(payload, replace)`：遍历 `STORE_NAMES`，媒体 `dataUrl` → `Blob`（`revivePieceMedia`），条目补 `key`。
+
+### 3.5 设置持久化
+
+`AppSettings` 存 `localStorage`（key `worldforge:settings`），载入时与 `DEFAULT_AI_SETTINGS` 合并（老版本缺的键用默认）。
+
+---
+
+## 四、AI 客户端与任务（`src/ai/`）
+
+### 4.1 HTTP 客户端（`client.ts`）
+
+- 统一 `POST /chat/completions`（OpenAI 兼容），支持 SSE 流式（`onDelta`）。
+- **直连 → 本机转发** 自动降级：直连失败（CORS 最常见）改走 `PROXY_PATH='/__wf-proxy'`（由 `server.mjs` / vite 中间件实现），带 `x-wf-upstream` 头。
+- `buildChatBody(settings, messages, streaming, options)` 纯函数：组装 `model/messages/temperature/max_tokens/top_p/response_format`，额外请求体（`extraBody`）最后合并、`messages` 不许覆盖。
+- `readExtras(settings)`：解析「额外请求头/额外请求体」两栏 JSON，写歪就抛（**绝不静默忽略**）。
+- `readErrorBody`：把非 2xx 整理成可读错误（抠 `error.message` / `message`）。
+- `chatWithMaterials`（在 tasks.ts）：带图调用失败时**去掉图重试一次**，并如实告知丢了图。
+
+### 4.2 任务 run 函数（`tasks.ts`）
+
+每个 run 函数 =「拼提示词 → `chat()` → `extractJson()` 容错解析 → 规整成 `ReviewItem[]`」。核心纪律：**取不到列表就报错，不许退化成空数组**（空数组=「它说没问题」，是结论；而答非所问是我们没读懂）。
+
+| 函数 | 产出 | 关键点 |
+|---|---|---|
+| `runGenerate` | `create-entry[] + relation[]` | 去重（`key`）、`findEntryByTitle` 解析关系、给 item 打 `source` |
+| `runExpand` | 单条 `update-entry` | 模型判「该删」→ `delete-entry` |
+| `runPolish` | `update-entry[] + relation[]` | 无改动返回 `[]`（空 diff 不入队）；`changes` 空则不入队 |
+| `runRelations` | `relation[]` | 去重双向、`unmatched` 如实交代 |
+| `runTimelineLayout` | `TimeLayoutItem[]` | 只排有依据的、只输出真实改动、不碰时间文本；锁定条目位置动→补 `from` |
+| `runTimelineGuess` | `TimeLayoutItem[]`（含 `from`） | 只对「没时间」的池子下手，`from` 必给 |
+| `runConsistency` | `consistency[]` | 带账本（`buildLedger`），入库前 `splitDuplicates` 拦旧账 |
+| `runArticleReview` | 审校结果 | `retrieveRelevant` 选相关条目 |
+| `runAsk` | 回答 + 引用 | 从 `[[...]]` 解析引用 |
+| `runIntake` | 理解 + 提问 | 轮次 `>=3` 强制收口 |
+| `runProposal`/`runProposalRevise` | 世界草案 | `normalizeProposal` 规整、保留用户取消勾选 |
+| `runDocExtract` | `create-entry[]` | 按分类名匹配、confidence 标注 |
+
+### 4.3 追加提示词（`extraInstruction`）
+
+```ts
+export interface RunOptions {
+  onDelta?; signal?;
+  extraInstruction?: string;  // 「再生成」时作者追加的提示词，只影响这一次
+}
+function extraInstructionMsg(opts: RunOptions): ChatMessageInput[] {
+  const extra = opts.extraInstruction?.trim();
+  return extra ? [{ role: 'user', content: extra }] : [];
+}
+```
+
+各 run 函数在 `user` 消息后追加 `...extraInstructionMsg(opts)`。
+
+### 4.4 再生成分发（`rerunBySource`）
+
+```ts
+export async function rerunBySource(settings, world, entries, categories,
+                                    source: ReviewSource, extraInstruction, opts)
+  : Promise<ReviewItem[]> {
+  const runOpts = { ...opts, extraInstruction };
+  switch (source.task) {
+    case 'generate':   /* 找 category → runGenerate */ break;
+    case 'polish':     /* 找 entry → runPolish */ break;
+    case 'relations':  /* runRelations */ break;
+    case 'timeline-layout': /* runTimelineLayout → 包成单张 ReviewItem */ break;
+    case 'timeline-guess':  /* runTimelineGuess → 包成单张 ReviewItem */ break;
+    case 'consistency':/* runConsistency */ break;
+  }
+}
+```
+
+### 4.5 容错解析（`parse.ts`）
+
+这是全项目对「模型输出不稳定」的防御核心：
+
+- `extractJsonEx(raw)`：剥 ```json 围栏 → `findJsonBounds` 深度扫描定位边界 → 严格 `JSON.parse` → 去尾逗号 → `closeTruncated`（截断修复，逐元素丢弃再试）→ `looseJson`（逐 token 结构修复）。
+- `looseJson`：处理「少写一个 `}`」、全角括号 `｛｝［］`、`//` 注释、裸换行、非法转义、没引号的字面量、缺逗号；**先验形**（必须带 `"key":`），修完能 `JSON.parse` 才算数，否则返回 `undefined` 让调用方报错——防止把随笔里的花括号"修"成空对象造成静默丢空。
+- `findList` / `asArray` / `hasListShape`：容忍列表包一层、键名别名、唯一数组字段自动识别。
+- `str` / `strArray`：宽松取值，`strArray` 认中英文逗号/顿号/分号分隔。
+
+### 4.6 服务商与型号（`providers.ts` / `models.ts` / `probe.ts`）
+
+- `PROVIDERS`：19 家预设，分三组 `main/aggregator/local`，全走 OpenAI 兼容。只列「见过出处」的地址。
+- `fallbackModels` 只是「还没拉到列表时的兜底」，真清单靠 `GET /models`。
+- `fetchModels` → `parseModelList`（认 `data/models/model_list` 三种壳）→ `sortModels`（能对话的在前，组内按 `createdAt` 新在前）。
+- `NON_CHAT_RE`：把 embed/tts/whisper/dall-e/rerank 等**排后 + 标注**而非隐藏。
+- 缓存：`localStorage` key `worldforge:models:{provider}@{baseUrl}`，UI 显示「上次获取」。
+- `switchProvider`：切厂商时先记 `modelByProvider` / `baseUrlByProvider`（只记与官方不同的地址），新家没型号则清空。
+- `probe.ts`：逐个发极短请求探测可用性，四态（绿=真回话/橙=余额/红=型号问题/灰=未探测），缓存 24h 跟 API Key 走，`PROBE_LIMIT=40`。
+
+---
+
+## 五、内置 Agent（`src/ai/agent/`）
+
+### 5.1 协议（`protocol.ts`）
+
+自定义 JSON 协议而非原生 function calling（任意 OpenAI 兼容端点 + 本地小模型支持度参差）：
+
+```json
+{"say": "…", "plan": [{"tool": "…", "args": {}, "why": "…"}]}
+```
+
+`parseAgentReply(raw)` 容错到极致：`plan` 是对象/数组/字符串都认、键名别名（`steps/actions/tool_calls`）、参数塞 `arguments/params`、`say` 和 `plan` 吐成两个并列对象、甚至少写 `}` 靠 `looseJson` 捞回（`salvaged`）。还解析 `todos`（待办清单，含 Markdown 复选框）、`done`、`suggest`（下一步建议）。
+
+### 5.2 工具箱（`tools.ts`）
+
+32 个工具，`risk: 'read'|'write'` 决定执行边界下是否拦截。核心设计：
+
+- **指认只用标题/别名**，`resolveEntry/resolveCategory/resolvePiece` 解析成 id（精确命中优先，歧义报错）。
+- **参数归一** `normalizeArgs`：模型把 `entry` 写成 `title/name/条目/标题` 都折回规范名；`ARG_ALIASES` 收全中英文同义写法。
+- **必填自检** `checkRequired`：报错能「照着重写」（缺哪个/认哪些/给的是什么）。
+- **提议** `propose(ctx, input)`：写类动作进审查队列 + 记 `propose` 日志（撤回=删那条待审记录）。
+- **`resolvePendingDraft`**：关系一端还在待审队列（刚提过、没批）时也能挂上，采纳时跟随生效。
+- **时间三态** `readTimeArgs`：`undefined`=没提、`null`=显式摘掉、`EntryTime`=改时间（`clearTime` 才摘）。
+
+写类工具的行为约定（关键）：
+- `create_entry` / `update_entry` / `delete_entry` / `create_relation` / `update_relation` / `delete_relation`：**一律进审查队列**（`propose`），不直接落库——「放手程度」只管「动作要不要先问」，管不到「产出要不要审」。
+- `create_category` / `update_world` / `create_piece` / `add_doc` / `update_settings` 等：直接落库（这些是低风险配置/非设定内容）。
+- `polish_entries`：批量打磨，最多 8 条（`POLISH_MAX`），逐条 `runPolish` + `propose`，支持 `signal` 中断。
+- `layout_timeline` / `guess_timeline`：调 `runTimelineLayout`/`runTimelineGuess` 后 `propose` 进队列。
+- `navigate`：只记「建议去哪个页面」，由界面渲染成可点按钮（`resolveAgentPage` 把旧页面名 `timeline/entries/pieces` 归到新路由 + 视图分支）。
+
+### 5.3 执行边界（`AgentMode`）
+
+```ts
+export type AgentMode = 'plan' | 'hybrid' | 'auto';
+// plan  : 读+写都先摆计划等确认
+// hybrid: 读立刻执行，写等确认
+// auto  : 读+写都立刻执行（但产出仍进审查队列）
+```
+
+循环由 `useAgent.ts` 驱动：解析回复 → 执行动作 → 回灌结果 → 再问一轮，直到 `plan` 为空。护栏：打转（`empty`/`badCall` 分别处理）、循环收尾（`exhausted`）、空承诺（`promised`）、清单未清（`todoLeft`）。
+
+---
+
+## 六、AI 任务与队列（`src/state/`）
+
+### 6.1 单发任务（`aiTasks.ts`）
+
+模块级 `Map<string, AITask>`，`useAITask(key, navKey)` 返回句柄：
+
+- 状态活在组件外，路由切换不丢 loading/流式/结果。
+- `startTask` 同一个 key 若在跑则先 abort（防结果覆盖）。
+- `run` 前用 `aiGuardKey(ai)` 校验配置（baseUrl/apiKey/model）。
+- 换世界隔离：`foreign` 判断世界不符按「没跑过」渲染。
+- `runningNavSignature()` 供侧栏转圈（返回排序字符串，保 `useSyncExternalStore` 引用稳定）。
+
+### 6.2 串行队列（`jobQueue.ts`）
+
+「点一下加一件、点十下加十件、串行一件件跑」的通用设施：
+
+- `CONCURRENCY = 1`（串行，不并发——AI 按量计费 + 写库顺序不能乱）。
+- `enqueueJobs(specs)`：`dedupeKey` 去重（同键且 live 时丢弃），返回真实入队数。
+- `pump()` 循环：取队首 → `run(signal)` → 成功记 `note` / 失败记 `error` / abort 记 `canceled`。
+- `cancelJob` / `retryJob`（跑法还在才能重试）/ `dismissJob` / `clearFinishedJobs`。
+- `hasLiveJobPrefix` 读内部表（非快照）——连点三下发生在重渲染前，判断必须用真表。
+
+### 6.3 agent 常驻运行器（`agentRunner.tsx`）
+
+`AgentRunnerProvider` 挂在 `Shell` 外层（`App.tsx`），`useAgent()` 的多步循环活在这里——路由切换只卸载页面不卸载 Shell，agent 干活期间切页不中断。页面只是「一块显示屏」，挂载时 `attach(threadId)` 声明在看哪段会话。
+
+---
+
+## 七、关键 lib（`src/lib/`）
+
+| 文件 | 职责 |
+|---|---|
+| `timeParse.ts` | 纪年文本 ↔ 数值换算。`parseTimeText`（认「120 年」「120 年 6 月」「前 3 年」「第3纪元45年」）、`formatTimeText`（还原「N 年 M 月」，月按 /12 折）、`monthOfValue` |
+| `relations.ts` | 双向关系归并 `mergeMutual` / `mergeMutualOf`（展示层，底层仍是两条独立 Relation） |
+| `export.ts` | `buildMarkdown` / `buildHtml`：锚点、内链、大事记、媒体内联 dataURL |
+| `markdown.ts` | `renderMarkdown`（`[[x]]`→`<span class="wl">`，`asset:ID`→占位） |
+| `diff.ts` | 字段级 diff |
+| `text.ts` | `tokenize` / `scoreEntry`（轻量检索） |
+| `wiki.ts` / `wikitext.ts` | Wiki 相关 |
+| `files.ts` | `extOf` 等 |
+| `images.ts` | 图片压缩（投喂素材/读图用） |
+| `autoLink.ts` | 内链自动补全 |
+| `id.ts` | `uid` / `entryKey` / `now` / `formatTime` |
+| `diagLog.ts` | 诊断日志（`diag`/`getDiagReport`/`analyzeStall`/`collectPostMortem`） |
+
+### 7.1 `entryKey`（条目不重名约束）
+
+标题归一化（大小写/空白/标点无关）作为世界内唯一 key，落库前拦截重复。
+
+### 7.2 一致性账本（`ai/consist.ts`）
+
+- `buildLedger(history, entries)`：把历次审计结果整理成账本，每条分 `bucket: 'open'|'settled'|'revisit'`（`revisit` = 已判定但相关条目此后被改过，靠 `entry.updatedAt > issue.createdAt` 判断）。
+- `blockedIssues` / `splitDuplicates`：字面级判重（`normIssueTitle` 去空白标点 + 包含关系，最短 4 字防误伤），入库前拦下旧账。**语义级「换个说法也算重复」交给提示词里的账本，代码只做不讲情面的字面兜底**。
+
+---
+
+## 八、路由与页面（`src/App.tsx` + `src/pages/`）
+
+### 8.1 路由（hash 路由，无 react-router）
+
+```ts
+type Route = 'dashboard'|'wiki'|'studio'|'review'|'docs'|'graph'
+            |'consistency'|'ask'|'log'|'article'|'export'|'settings';
+```
+
+- `readHash()`：hash → route + wikiView；`WIKI_ALIAS` 认旧路由 `entries`/`pieces`。
+- `hashOf()`：Wiki 三个子页各有地址（`#wiki/#entries/#pieces`）。
+- 状态提升：`wikiView` / `graphView` 放 Shell 层，让 agent 的 `navigate` 回执能点名要哪一支（页面自己的 useState 收不到）。
+
+### 8.2 页面清单
+
+| 页面 | 文件 | 要点 |
+|---|---|---|
+| 总览 | `Dashboard.tsx` | 世界信息 + 统计 + 结构体检（单薄分类） |
+| Wiki | `WikiPage.tsx` | 三个子页：display（读）/ entries（编辑）/ pieces（杂物间） |
+| 关系与时间 | `GraphPage.tsx` | 三支：relations（力导向图）/ time（点轴）/ chronicle（编年，第一入口） |
+| AI 工作台 | `StudioPage.tsx` | agent 会话 + 三档放手程度 |
+| 审查队列 | `ReviewPage.tsx` | 逐条 diff、采纳/改/驳回、批量、再生成/撤回 |
+| 资料库 | `DocsPage.tsx` | 上传/粘贴资料，AI 抽取 |
+| 一致性 | `ConsistencyPage.tsx` | 账本 + 逐条/全部生成修订 |
+| 问答 | `AskPage.tsx` | 只读历史 |
+| 日志 | `ActivityLogPage.tsx` | 操作日志 + 撤销 |
+| 审校 | `ArticlePage.tsx` | 检查文章是否违背设定 |
+| 导出 | `ExportPage.tsx` | Markdown/HTML/JSON |
+| 设置 | `SettingsPage.tsx` | AI 模型/语言/世界/数据 |
+
+### 8.3 审查队列「再生成 / 撤回」（`ReviewPage.tsx`）
+
+- 状态：`rerunOpen` / `rerunText` / `rerunning`。
+- 点「再生成」→ `rerunBySource(settings, world, entries, categories, item.source, rerunText)` → 取新结果**第一条同类项**替换当前卡（旧卡存 `superseded`），其余追加到队列。
+- 点「撤回」→ 用 `superseded` 恢复旧提议。
+- `RerunModal`：textarea 输入追加提示词 + 确认/取消。
+
+---
+
+## 九、i18n（`src/i18n/`）
+
+- `zh/`（事实来源）→ `en/`（`const en: Record<keyof typeof zh, string>`）→ `t()`。
+- 非 React 层（`lib/`/`ai`（除组件）/`storage`/`types.ts`）不得 import `../i18n`（.tsx），改用 `i18n/translate` 的 `tGlobal`/`MsgKey`、`i18n/core` 的 `localeMeta`。
+- 只软编码、不改措辞（逐字保留）。`kind.piece.*` 的图标/文案 key 在 `types.ts` 的 `PIECE_KINDS` 里。
+
+---
+
+## 十、构建与验证（根目录脚本）
+
+```json
+"scripts": {
+  "dev": "vite",
+  "build": "tsc -b && vite build",
+  "preview": "vite preview --port 4173",
+  "start": "node server.mjs",
+  "typecheck": "tsc --noEmit"
+}
+```
+
+配套验证工具（`.dev/` 目录）：`i18n-coverage.mjs`（i18n 覆盖扫描）、`unit-prompts.mjs` / `unit-args.mjs` / `unit-agent-prompt.mjs` / `unit-relations.mjs` / `unit-timeparse.mjs`（单测）、`e2e-*.mjs`（端到端，配 `mock-upstream.mjs` 假上游 + `server.mjs` 静态服务）。
+
+---
+
+## 十一、已预留的升级空间（架构锚点）
+
+| 方向 | 落点 | 说明 |
+|---|---|---|
+| 云端同步 | `storage/rest.ts` + `storage/index.ts` | `StorageAdapter` 已抽象，切工厂即可 |
+| 多语言 | `i18n/locales/{zh,en}` | 加语言 = 复制语言包 + 注册 |
+| 新 AI 厂商/型号 | `ai/providers.ts`（OpenAI 兼容）+ `models.ts` | 手填型号已支持，新厂商零代码 |
+| 任务队列扩展 | `state/jobQueue.ts` | 通用设施，`enqueueJob(...)` 一行接入 |
+| agent 新工具 | `ai/agent/tools.ts` 的 `AGENT_TOOLS` + `AgentToolName` | 加工具需同时补 `TOOL_LABEL`（tsc 强制） |
+| 时间轴版式 | `GraphPage` 三支 | 「时间」与「编年」并存，比对后撤一支 |
+| 数据库升级 | `DB_VERSION` + `migrateTimeline` 闸门 | 旧数据自动迁移 |
+
+---
+
+*本手册基于源码实读整理，覆盖数据模型、存储、状态、AI 客户端/任务、agent、队列、lib、路由页面、i18n、构建验证全链路。功能对应用户可见，代码对应可维护落点，随产品演进同步更新。*

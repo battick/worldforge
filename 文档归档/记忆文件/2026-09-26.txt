@@ -1,0 +1,161 @@
+# 2026-09-26
+
+## WorldForge · 个人世界观知识库（新建项目）
+
+从零搭建了一个单机优先的个人世界观管理工具，位于 `C:/Users/xaya/Desktop/新建文件夹`。
+
+**产品核心闭环**：AI 产出候选 → 进审查队列 → 用户采纳才写入正式设定库。AI 永不直接改设定集。
+
+**技术栈**：Vite + React 18 + TypeScript，无 UI 框架（手写 CSS 设计系统），IndexedDB 本地存储。
+AI 走 OpenAI 兼容协议，内置 8 个厂商预设（DeepSeek/OpenAI/Moonshot/智谱/通义/SiliconFlow/Ollama/自定义）。
+
+**目录要点**：
+- `src/ai/prompts.ts` 是灵魂：每次生成都强制注入「世界基调 + 已有设定索引」，这是防止 AI 跑偏/重复的关键
+- `src/storage/` 做了适配器抽象，`rest.ts` 是云端占位，未来升级云同步不用改业务代码
+- `src/pages/` 共 11 个页面（总览/条目库/关系图谱/AI工作台/审查队列/资料库/一致性检查/世界问答/文章审校/导出/设置）
+- `server.mjs` + `start.bat`：本地启动器（静态托管 + 同源转发）
+- `.dev/` 是开发期验证工具，不参与构建
+
+**关键决策**：不做 file:// 双击运行。生产包是 ES Module，file:// 会被 CORS 拦死，必须走本地 http 服务，
+因此提供 `start.bat` 一键启动。
+
+## 踩坑记录（重要）
+
+1. **浏览器直连模型厂商会被 CORS 拦**（尤其带 Authorization 头触发预检时）。
+   解决方案：`tools/local-proxy.mjs` 提供同源转发 `/__wf-proxy`，前端直连失败自动回退。
+   该转发器同时挂给 vite dev/preview 和 server.mjs。
+
+2. **Node HTTP 服务里 `req`/`res` 的 `close` 事件会在「请求体读完」时立刻触发**，
+   不能用它做 AbortController 的中止信号 —— 会把还没返回的上游响应（尤其是 SSE 流）当场掐断，
+   表现为前端无限转圈。正确做法：显式 read loop + `finally { res.end() }`，不依赖 close 事件。
+
+3. **无头 Chrome 的 `--virtual-time-budget` 模式下 IndexedDB 回调不会触发**，
+   会让初始化停在加载态，看起来像应用有 bug。必须改用 CDP（`--remote-debugging-port`）做真实渲染验证。
+
+4. **仅改 hash 的导航属于同文档导航，不会重新挂载 React**，测试时需加查询参数强制整页加载。
+   顺带修了应用里真实的缺陷：补上 `hashchange` 监听（否则浏览器前进/后退无效）。
+
+5. **原生 `confirm()` 会阻塞无头页面**，CDP 脚本需监听 `Page.javascriptDialogOpening` 并自动确认。
+
+6. **路由初始化的竞态（自己引入并修掉的真实 bug）**：
+   最初写法是「useState('dashboard') + effect 读 hash setRoute + 另一个 effect 把 route 写回 hash」，
+   首次加载时第二个 effect 会用初始值 `dashboard` 覆盖 URL 上的 hash，触发 hashchange 后
+   再把路由抢回总览 —— 表现为深链（如 `#studio`）时灵时不灵。
+   修法：改用 `useState(() => 从 hash 惰性初始化)`，让首屏 route 与 hash 天然一致，彻底消除竞态。
+
+## 验证方式
+
+写了完整的假上游 + 端到端脚本，不消耗真实 API Key 就能验证整条 AI 链路：
+- `.dev/mock-upstream.mjs` 假模型服务（默认故意不发 CORS 头，用于验证转发兜底）
+- `.dev/e2e.mjs` 生成 → 解析 → 送审 → 采纳入库
+- `.dev/sweep.mjs` 全页面巡检（11/11 通过）
+- `.dev/shot.mjs` 单页截图
+
+验证结果：采纳「闭城月」后侧栏从 10 条目/9 关系 → 11 条目/11 关系，新条目与其关系同时生效，符合设计。
+
+## 补丁：启动器端口占用（用户反馈 start.bat 报端口被占）
+
+起因：开发期后台测试服务（server.mjs@5188、vite preview@5199）没退干净，用户双击 start.bat 直接失败。
+
+修复 `server.mjs`，端口冲突分两种情况处理：
+1. **占用者是自己**（探测 `127.0.0.1:PORT/` 返回的 HTML 含 "WorldForge"）→ 不再另起实例，直接打开已有地址后退出。
+   原因：数据按源隔离（**端口是源的一部分**，不同端口 = 不同 IndexedDB），另起端口会让用户以为数据丢了。
+2. **占用者是别的程序** → 自动向后找可用端口（最多 20 次），控制台打印实际地址。
+
+要点：`createServer` 用工厂函数包一层，`error` 事件里重新 `start()`；错误回调改成 async 以便先探测。
+已实测三种场景：正常启动 / 重复启动（识别已有实例）/ 被其他程序占用（5188→5189）。
+
+**教训**：开发期起的后台服务，收尾必须确认进程真的退出（`netstat -ano | grep LISTENING`），
+否则会给用户留下「一启动就报错」的坑。杀进程用 `taskkill //PID <pid> //F`（Git Bash 里需双斜杠）。
+
+## 重做「新建世界」：从填表改成 AI 共创（用户明确要求）
+
+用户原话：「原来的太刻意，就像在写一个 ai 角色卡一样，我不需要这个」。
+要求：新建世界可以让用户自由上传旧文章/图片/现写规则 → AI 自动统筹 → 写出设定给用户看 →
+**一直问到用户真正确认为止，在此之前不算建好**；并删掉默认的灰烬纪年。
+
+### 新流程（components/WorldOnboarding.tsx）
+
+**随手放素材 → AI 读懂并追问（≤3 轮）→ 统筹出设定草案 → 可反复提意见重写 → 二次确认 → 落库**
+
+关键实现点：
+- 新增 `drafts` store（IndexedDB 版本 1→2，`onupgradeneeded` 按需补建，老数据不动）。
+  草稿不属于任何世界，因此**没有 worldId**，为此加了 `GLOBAL_STORES` 排除 worldId 索引。
+- `commitDraft` 是整个产品**唯一**会产出世界数据的入口（世界+分类+条目+关系+资料一次写完）。
+  确认前的任何操作都只改草稿。
+- 素材支持 4 类：file / text（粘贴）/ rule（现写规则）/ image。
+  rule 类在提示词里标注为「作者现写下的规则」，优先级最高。
+- 图片：`lib/images.ts` 用 canvas 压到长边 1280/JPEG 0.82（手机照片直接送模型又慢又容易被拒），
+  另存 260px 缩略图给界面。`client.ts` 的 `ChatMessageInput.content` 扩展为
+  `string | ContentPart[]`，图片走 `image_url` + dataURL。
+- **读图必须能降级**：`chatWithMaterials()` 带图失败就去掉图重试一次，并把「跳过了 N 张图」明确告诉用户。
+  纯文本模型用户占了相当比例，这里卡死等于流程不可用。设置页给了 `vision` 开关。
+- 提问纪律写死在提示词里，这是本次改造的灵魂：
+  只问「不问就没法往下写」的（核心矛盾/力量边界/时代尺度/主角处境）；
+  能推断的一律不问直接写进 understanding；禁止问文风偏好与「再详细点」；
+  每个问题必须给 suggest 让用户能偷懒；第 3 轮强制收口（`hardStop`）防止把用户问烦。
+- 输入侧防跑偏：`normalizeProposal` 会把引用了不存在分类的条目补分类、
+  丢掉两端不存在的脏关系、把 themeColor 收敛到白名单色。
+  修订时保留用户手动取消勾选的状态（AI 不知道这些）。
+
+### 删掉演示世界
+
+- 删除 `src/data/demo.ts` 与自动播种；`loadDemo()` 从 store 与设置页移除。
+- 无世界时：除「设置」外的导航置灰，所有路由让位给 `pages/StartPage.tsx` 引导页。
+- **没有自动删除老用户库里已有的灰烬纪年** —— 那是破坏性操作，可能连带删掉用户往里加的内容。
+  改为在交付说明里告知手动删除。
+
+### 数据模型要点
+
+`WorldDraft` 里有 `qa`（跨轮次累计问答）与 `questions`（当前未答的一轮）两个字段，
+不要合并：送模型时要把历史问答全带上，否则 AI 会重复问已经答过的。
+`understanding` / `observations` 只保留最新一版（历史理解没必要留）。
+
+## 验证
+
+- `.dev/e2e-onboarding.mjs`（新）：43 项断言全通过。
+  覆盖投喂三类素材（含上传一张真实生成的 PNG）→ 追问两轮 → 草案 → 修订 → 取消勾选 → 二次确认建库
+  → 素材进资料库 → 再跑一次「生成→审查→采纳」回归。假上游新增 `GET /__mock-stats`
+  暴露各分支命中数与收到过的最大图片数，用来断言「图片真的送到了模型」与「没有请求落到 unknown 分支」。
+- `.dev/sweep.mjs`：改为先用 `Runtime.evaluate` 直接往 IndexedDB 写一个最小世界再逐页巡检
+  （不再依赖演示数据），现在还会比对标题是否与路由匹配。11/11 通过。
+- 删掉了旧的 `.dev/e2e.mjs`（依赖已删除的演示数据，且新脚本已覆盖其全部内容）。
+
+
+## 修复：卡在「正在打开你的世界观库…」
+
+- 原因：DB_VERSION 1→2 升级时，若浏览器里还有旧标签页持有 v1 连接，`indexedDB.open` 会触发
+  `blocked` 事件并永久挂起；原代码没写 `onblocked` 处理 → 无限转圈、无任何报错。
+- 修复（`src/storage/indexeddb.ts`）：
+  1. `open.onblocked` → reject 并给出「请关闭其他 WorldForge 标签页后刷新」的明确提示；
+  2. 打开成功后挂 `db.onversionchange = () => db.close()`，本页面持有旧连接时主动让位，
+     不再阻塞别的页面升级；
+  3. 15 秒兜底超时，任何挂起都变成可读报错而非无限等待。
+- `src/App.tsx` 错误卡提示列表补充「其他标签页占用数据库」场景。
+- 新增 `.dev/e2e-blocked-db.mjs`：用 `Page.addScriptToEvaluateOnNewDocument` 注入一段
+  「以 v1 打开并占住连接」的脚本来模拟旧标签页，验证 6/6 断言通过
+  （报错可见 → 有重载按钮 → 释放占用后刷新正常启动 → DB 升到 v2）。
+- 重新构建 dist 并跑 `.dev/sweep.mjs` 全页巡检：11/11 通过。
+
+## 新功能：作者单方面交代（told）+ 修复草案 JSON 截断解析失败
+
+用户反馈两点：
+1. 问答阶段要有一个「other」入口 —— 只有用户单方面向 AI 诉说、不针对任何问题的内容，优先级最高。
+2. 点「够了，直接写草案」报「无法解析模型返回的 JSON」：模型输出撞到 token 上限被拦腰斩断。
+
+改动：
+- `src/types.ts`：`WorldDraft` 新增 `told: { id, text, createdAt }[]`（旧草稿缺字段按 `?? []` 兜底）。
+- `src/ai/prompts.ts`：新增 `renderTold` / `TOLD_RULE`（作者交代=最高优先级，冲突时以此为准、
+  绝不问回已交代的事），注入 intake / proposal / revise 三个提示词；草案输出规模收紧
+  （entries 6-20→6-14、content 200-600→150-450 字）并加「输出完整性高于一切」硬纪律。
+- `src/ai/parse.ts`：`extractJson` 新增截断修复 —— `closeTruncated` 补齐未闭合的字符串/
+  括号（含悬空转义符），失败则逐步丢弃最后一个逗号后的残缺元素重试（最多 24 轮）。
+  用户报错的那种「字符串中途斩断」形态现在能直接抢救。
+- `src/components/WorldOnboarding.tsx`：新增「不针对问题，我就是想说」卡片（textarea +
+  记下来/删除，随下一次 AI 调用发送）；顺手删掉了从未渲染过输入框的死代码 `extra` state
+  （其提示词语义由 told 取代）。
+- `.dev/mock-upstream.mjs`：ctx 提取 told；proposal 收到含「模拟截断」的交代时返回砍到
+  60% 的半截 JSON；told 会以「（作者交代，最高优先级）」前缀进草案 rules。
+- `.dev/e2e-onboarding.mjs`：新增 6.5（told 录入→草案规则体现）与 13（截断修复）两个场景，
+  59/59 断言通过；全页巡检 11/11。
+- 注意：世界菜单项是 div 不是 button，CDP 点击助手只搜 button，场景 13 改用 evaluate 直接点。

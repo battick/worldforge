@@ -1,0 +1,414 @@
+# WorldForge 项目须知（跨会话）
+
+个人世界观知识库。**单机优先**：Vite 5 + React 18 + TS strict + IndexedDB，**零额外运行时依赖**（只有
+jszip / pdfjs-dist 解析文档）。注释/文档用中文，写「为什么」不写「做了什么」。
+
+跑法：改完至少 `npm run typecheck` + `node .dev/i18n-coverage.mjs` + `node .dev/unit-prompts.mjs` +
+`node .dev/unit-agent-prompt.mjs`；**先构建后跑单测**（safe-delete 额度，见 §11）；动了页面再 `npm run build`
++ 起服务跑对应 `.dev/e2e-*.mjs`。
+
+## 1. i18n
+
+- 用户可见文字一律 i18n，**不引新依赖**（i18n / Markdown / 力导向 / 提示泡全自实现）。顺序：`locales/zh/<模块>.ts`
+  加 key（**zh 是事实来源**）→ `en/<模块>.ts` → 才在代码里 `t()`。`en` 每个模块文件顶上**必须**有
+  `const en: Record<keyof typeof zh, string> = { ... }; export default en;` —— `en.ts` 聚合层没有这一行，守卫是
+  **逐模块**生效的（`en/editor.ts`、`en/wiki.ts` 都漏过一次）。
+- **非 React 层**（`src/lib`、`src/ai`（除组件）、`src/storage`、`types.ts`）**别 import `../i18n`**（那是 .tsx，会把
+  React 拖进纯逻辑层）。用 `../i18n/translate` 的 `tGlobal`/`MsgKey`、`../i18n/core` 的 `localeMeta`。
+- **只软编码、不改措辞**（逐字保留原文；子代理爱把「改名」写成「重命名」，会被 e2e 抓）。**e2e 断言原始中文**，
+  写断言前先 `grep` 语言包（`common.charCount` 是 **`{n} 字`**）。
+- **孤儿键**（文案写好没人引用）出现过三次、`grep` 看不出 → 靠 `unit-agent-prompt.mjs` 机器对：`agent.sys.*` 必须在
+  `prompts.ts`/`tools.ts`/`protocol.ts`/`useAgent.ts` 被引用，反向也要成立，且中英逐键对齐。
+- 覆盖扫描会把 `ch === '｝'` 当硬编码中文报 → **抽成映射表**，别逐行 `// i18n-allow`。
+- **删 key 要连多行值的值行一起删**：只删 key 行会留下孤立的半截字符串，`tsc` 报 `TS1005: ':' expected.`
+  （列号在字符串末尾，特别像语法坏了）。
+
+## 2. 数据层 / store
+
+- **每个写操作都要 `logOp()`**（带撤销快照 `OpUndo`）—— 这是「AI 敢放手改数据」的全部底气。删类快照要含**连带删掉的
+  子项**（删条目→关系；删分类→条目+关系）。`undoOp()` 走底层 storage 直写、不产新日志；撤销「新建条目」还要清掉
+  挂在它上面的关系。
+- **store 写函数必须读 `dbRef.current`，不能读渲染期闭包里的 `db`**：写操作都是「找出这条 → 合并 → 整条写回」，
+  `db` 一过期就盖掉别处刚写的字段。**一次点击里写两回同一条**必然发生（「保存」+「保存时间」）→ 第二回拿旧条目把
+  刚存的正文覆盖掉、界面毫无异常。修法：`setDb` **先把新值记进 `dbRef` 再交给 React**。
+  （`e2e-timeline` 抓出：时间对了、标题退回去了 = 真丢数据。）
+- **同一类病：基于旧值算新值一律函数式写法**。`setHiddenCats(new Set(hiddenCats))` 同 tick 连点两次会覆盖第一次
+  （回调读同一份闭包）；真人手点看不出，是 e2e「一口气点两个图例」顶出来的。
+- **新增 store 要一次改六处**：`storage/types.ts` 的 `StoreName`+`STORE_NAMES` → `storage/indexeddb.ts` 的
+  `DB_VERSION`（**升一位**）→ `store.tsx` 的 `interface DB`/`EMPTY_DB`/`STORE_OF`/`deleteWorld` 快照（含 `groups`）
+  → `AGENT_PAGES` 类清单。`.dev/` 里写死 `indexedDB.open('worldforge', N)` 与 `DB_VERSION` 的脚本同步升版。
+  `importBackup` 遍历 `STORE_NAMES`，新 store 自动跟备份走。
+- **「资料入库」只有一条正道**：`store.addDoc()` 并填齐 `worldId/name/ext/size/text/parsed/addedAt`；绕开直接写
+  `docs` store 会让「抽取条目」漏字段。
+- **迁移必须在独立 `useEffect` 触发**（`migrateTimeline` + `World.timelineMigratedAt` 闸门）：写在初始化那个 effect
+  里的话，那个 `db` 闭包还是空的，等于什么都没迁。**同一动作两个入口只留一个写函数**（时间轴拖入/点击都走 `placeAt(id, at)`）。
+- **按「分组」输出会重排历史，别做**：导大事记按纪元 `filter` 会打乱时间顺序 → **按 `at` 遍历、换段时才开新小节**
+  （小节是阅读辅助，先后才是本体）。
+
+### 2.1 `Entry.time`：时间挂在条目上，不是另一张表
+
+（`TimelineEvent` 已废，只作迁移来源。）
+
+- **双写**：纪年原文按字符串排会把「10 年」排到「9 年」前 → 同时存作者原文 `from`/`to` 与数值 `at`/`toAt`。轴靠 `at`；
+  `toAt` 可选（有→按比例实线，无→固定长虚线）。「按比例 / 均匀铺开」是**画法**，切换不许动 `at`。
+- **形态显式三选一**（`kind: 'point' | 'range' | 'ongoing'`），**绝不靠「终点空不空」猜**。
+- **「没提时间」≠「去掉时间」**：`readTimeArgs` 返回 `undefined`=没提、`null`=明说去掉（只有 `clearTime`）。
+  混成一个，agent 每改一次正文就顺手抹掉时间。
+- **位置不给模型猜**：解析出的时间没 `at`/`toAt` 时由 `nextAt` 按轴末补齐。写回走 `setEntryTime`，**不许塞进
+  `updateEntry` 的 patch**（浅合并把 `at` 抹成 undefined → 条目甩到轴最左边，界面看不出）。
+- **落位只写位置不编时间文本**：拖进来只有 `at`、没 `from`，代码没资格替作者编年份 → 画**虚线圈**（`data-notime="1"`）
+  + 图例「位置定了，时间文字还没写」。
+
+## 3. AI 解析与工具契约
+
+- **协议解析绝不能静默丢动作**（`plan` 写成对象 / 键名换 `steps` / 参数塞 `arguments` / `plan` 被序列化 / say 与 plan
+  是两个并列 JSON / 根级直接给动作 / `CreateEntry` 写法）。丢掉后作者感受是「它说完了然后什么都没发生」**且无从
+  判断是模型不想做还是解析吃了**。救不回就打 `protocolBroken` 如实说。工具名查找走 `findTool()`（容大小写/分隔符）。
+- **有损救援不许排在无损前面**：「从最后一个逗号切下、前缀能解析就算」是有损的 —— 同一份 8 动作输出被切到只剩 1 个
+  **还报成功**（界面正常、内容没了，最难查的一类，作者原话「它根本就没补全」）。次序：结尾收尾括号 → **先逐 token
+  修结构** → 才切尾，且切尾只在「真被截断」时用（`closeTruncated` 返回 `truncated` 标志，别猜）。
+- **「只往末尾补括号」救不了「中间少一个」**：8 条 `create_entry` 各少一个收尾 `}` 时末尾逗号修不掉、`closeTruncated`
+  看不见 → 靠逐 token 状态机：**在「该写键名」处撞见 `{` 就补 `}` 收掉当前层、再拿同一 token 到外层重试**；补前先
+  撤掉紧挨的尾逗号（否则 `{… ,}` 非法）。
+- **修复必须守门，宁可报错也不许静默丢空**。`looseJson` 三条：①粗判「像 JSON」（有带引号的键+冒号）；②改动数 >
+  `min(64, 字符数/8)` → `undefined`；③修完真能 parse。否则随笔里随便一个 `{…}` 会被「修」成空对象。
+- **修好了也要说，且与「真废了」分开**：三态 `repaired`（中性色）/ `retried` / `gaveUp`（警示色）。**修复 ≠ 放过**
+  （提议照旧进审查队列）。
+- **工具的参数名是契约且必须印给模型看**。`AgentTool.args` 三处共用：①`normalizeArgs()` 折别名回规范名（`entry` 写成
+  `title`/`name`/`标题` 都认，大小写与分隔符不计；别名是**移动**不是复制），工具内部只读 `args.<规范名>`；
+  ②`renderToolList()` 印进清单（`｜参数：entry（必填）`），不印模型只能从散文猜；③`unit-args.mjs` 静态自检。
+  **归一第二遍刻意不抢本工具自己的另一个规范名**（`update_entry` 的 `title` 是「改成什么标题」不是「改哪一个」），
+  歧义照实报缺。
+- **缺参数的报错必须「能照着重写」**：说清**缺哪个 / 这工具认哪些 / 你给的是什么**。曾只说「缺少标题」而模型明明写
+  了、只是写在 `title` 键上 → 它读不出「键名我不认识」，只能原样重试，连试 8 次撞护栏中止。
+  **「值写错」也算「调用写错」**：分类名对不上时报错必须带上**现有分类清单**（否则它只会自己造一个）。
+- **提示词返回形状 ↔ `asArray` 的 `LIST_KEYS` 白名单是一份契约，改一边必须改另一边**。漏登记（曾漏 `issues`/
+  `relations`）→ **整份结果静默丢空**（报「没有发现冲突」却一副成功样）。兜底：整份只有**一个数组字段**就认它
+  （容忍再包一层）；多个数组字段**不猜**（真歧义时猜错比返回空更糟）。
+- **「读不懂」不许冒充「没问题」**：`hasListShape()` 分出 `{"issues": []}`（真结论）与 `{"note":"一切自洽"}`
+  （答非所问 → **报错**）；`requireList()` 拿不到列表**不许退化成空数组**。**凡「空结果」会被界面译成一句安抚话的
+  地方，都要先确认那个空是真结论。** 同族：「没有新问题」≠「没有发现问题」（别共用 toast）；AI 报「没有改动」要说
+  人话（没变的不列、对不上的报「N 个清单里对不上」，不是摆一份一模一样的空方案）。
+- **全角只在结构判断处归一**：`｛｝［］：` 走 `FULLWIDTH` 映射 + `at(k)`；引号全角变体**不认**（猜错不如说读不懂）。
+
+## 4. agent 循环（`state/useAgent.ts` + `ai/agent/`）
+
+- **系统提示词每轮重新构建**（它刚改完库，旧上下文会让它以为没做过）；会话**整段覆盖保存**（`saveThread`），不能用
+  闭包里的 `db.chats` 读改写。写操作后打 `dirtyRef`、下个动作前 `refreshLive()` 重取快照（否则「新建条目 → 连关系」
+  找不到刚建的条目）。
+- **`say` 里承诺动手却把 `plan` 留空 = 这件事就此结束**（模型爱写「我先看看」）。提示词明写「只要打算用工具、哪怕
+  只是查看也要写进 plan」；整轮不合格式时 `useAgent` 补一轮 `agent.sys.repair`（`run.repaired` 限一次）。
+  **界面处置措辞在落库那一刻定死**（`protocolBroken: 'retried' | 'gaveUp'`），别按「是不是最后一条」猜
+  （那样会先显示一种说法、下一轮又翻成另一种）。
+- **`plan: []` ≠ 做完了**：真实翻车 —— 20 条只读了 3 条，说「接下来我将继续检查……」然后 `plan` 给 `[]` 收工。补了显式
+  `done`，**清单没清空不许收工**：追问（最多 2 次）→ 催不动就把「还剩几条/哪几条」摆出来收尾。**把没做完的项从清单
+  划掉**是最省事的假装做完 → 少掉的项要数一份回灌（`agent.sys.todoCleared`）。轮数 6→20，打转仍由
+  `STALL_NUDGE`/`STALL_STOP` 兜。**「待办清单」和「动作」可以同一轮给**（先立账再动手，判据 `todosGiven`）。
+- **「查不到就问，别换个关键词接着查」**：零命中 = 信息不够，写死在提示词。`ask_author` 是 **terminal**（本轮终点、
+  后续标 skipped），**不受三档边界约束**。护栏：`签名 = 工具+排序参数` 拦重复（`agent.fail.repeated`）；`stalls` 累积
+  失败/零命中/重复 → `STALL_NUDGE=2` 提醒一次、`STALL_STOP=4` 停下写 `turn.stuck`。
+- **签名去重只拦「成功过的那次」，写操作作废之前的签名**：①失败过的动作允许重试（前提可能已变），拦下时回执要
+  **引出上一次的真实结果**（只写「这步做过了」模型会脑补成「已办好」）；②`worldRev` 每成功写一次 +1，作废那之前的
+  签名。分界线是**「这件事做没做」**。
+- **「调用写错了」和「查不到」是两件事，分岔到最后一米**：四处都得分开，缺一处等于没分 —— 失败回灌
+  （`resultEmpty`/`resultBadCall` ← `ToolOutcome.badCall`）、护栏插话（`stuckNudge`/`badCallNudge`）、停下说明
+  （`agent.err.stuck`/`stuckBadCall`）、**对话短标记**（`ChatTurn.stuck: 'empty' | 'badCall'` → `stuckTag`/
+  `stuckBadCallTag`）。给反了建议，模型就去做一件解决不了当前问题的事，而护栏看着还挺正常。
+- **「AI 没有上下文记忆」根在每次发问都从白纸开始**（`run.history` 只装本次交代）。补法：每轮把**这次交代之前**的对话
+  （最近 6 条、每条截 220 字）印进系统提示词。三条挑法为让它**像对话不像日志**：①不要**系统轮**（`todoLeft`/
+  `promised`/`stuck`/`exhausted` 是循环对它说的，带回去它会当成自己讲过）；②不要一句话没说的轮；③从末尾往前取、
+  够就停。标题必须点破「这是语境不是要你重做」。取语境**谁新用谁**（`threadRef` 可能比 `store.threads` 多几轮）。
+- **给模型的「作业指导」写进系统提示词，别指望它推**。典型：作者说「把提到过、还没建的补全」时最省事的偷懒是
+  **只读条目索引**（只有标题摘要）就下结论 —— 人名器物多半只在**正文**里。`agent.sys.complete` 写死顺序：先
+  `read_entry` 把相关正文读进来（一轮放多个动作）→ 拿每个专有名字去库里对（含别名、**含审查队列里待批的**）→
+  只提真缺且当独立实体用的（比喻/形容词/泛指不提，拿不准的攒起来问）→ 一次给齐 `title/category/summary` + 正文骨架
+  → 收尾**报数**，且不许把「已提交审查」说成「已经建好了」。
+- **工具说明只能提真实存在的工具**（曾写 `list_categories` 但工具箱没它 → 诱导幻觉调用）。界面显示**人话标签**
+  （`toolLabel()` ← `TOOL_LABEL`），别把 `create_entry` 漏给作者看。
+- **AI「锦上添花」必须能静默降级**：提示泡/建议答案失败不许弹错、不许挡主流程，退回内置示例或保留上一批。这类请求
+  **别走 `useAIAction`**（会占 loading/stream 搅乱主任务对话气泡），自己管 busy。
+- **提示泡只负责「填」，不替作者发**：`studio.suggest.*` 摆出问句 → 点一下填进输入框（**已有内容追加一行、不覆盖**）
+  并聚焦（`StudioPage.draft` + 受控 `AgentComposer`）；新建世界的 `ob-suggest` 是**候选答案**，语义不同、那边仍覆盖。
+  **「建议/候选答案」点一下就发出去**（别让作者再按回车），**唯独「回它」那颗例外**。「一点就跑」≠「一点就改库」。
+- **「下一步建议」只在「把话交回给作者」的轮次算数**：判据 `plan` 为空**或全 terminal**。**这个判断写在循环里、不在
+  解析层**（解析层照收，不收就永远测不到）。界面只让**最后一条** AI 轮的按钮可点（`data-stale` 标翻页的）。
+  **模型自己给了建议的那一轮，别再花一次请求替它出题**（`runSuggest` 让位）。
+- **AI 审计类任务必须自带账本，否则每轮只报同一批**（作者原话「每次检查冲突结果都是一样的永远是那几个」）。两处根子：
+  ①**作者动作要回流** —— `buildLedger()` 把历史问题按「还该不该重看」分三组塞进提示词（未处理/已判定/可重看），
+  明写「换个说法也算重复」；②**入库前再拦一道** —— `splitDuplicates()`（提示词是请它自觉，入库是纪律），拦下的
+  **如实报**（`skipped`）。判重**只认字面**（归一后相同或一个套着另一个）：量过 —— 同一问题两种说法余弦 0.38、
+  同批条目上两条**不相干**问题能到 0.26，线太窄，放宽就吃真问题。**「把真问题当重复悄悄丢掉」比「多显示一条重复」
+  严重得多：宁可漏，不可错杀。**
+- **「还该不该重看」用时间戳判，别让模型猜**：`touchedSince()` = `entry.updatedAt > issue.createdAt`。改过 → 放行
+  重看（强制写明「相比上次的变化」）；没改过 → 作者已拍板。相关条目**被删不算改过**。
+- **送进模型的东西要有「总预算」，不只是单条上限；送入范围必须说实话**：`expandEntries(..., 900)` 只有单条上限 →
+  条目一多上下文爆掉、服务端悄悄截尾，而 `store.entries` 按 `updatedAt` 倒序**每轮排同一批** → 永远那几条问题。
+  按条目数平分总预算（下限 200 字），回一份「列了几条/每条约几字」的回执并写进提示词（「别把『我没看到』当成
+  『没问题』」）。**界面上写的数字必须来自真正生效的那一份**（`contextLimit` 曾只有工作台在读）。
+- **已判定（已处理/已忽略）的问题别继续占待办**（默认只看 `pending`，判过的折进「全部」可回看，别抹掉）。空态分两种：
+  「还没有审计记录」与「待处理清空了」。
+
+## 5. AI 任务 / 队列 / 批量
+
+- **AI 任务状态别住在页面里**（`useState` 会随路由卸载丢一切）→ 走 `state/aiTasks.ts` 模块级任务表 + `useAITask(key,
+  navKey)`；工作台 agent 运行器挂 `Shell`（`agentRunner.tsx`），页面只 `attach(threadId)`。**结果与勾选一起搬**
+  （`{items, picked}`，只搬结果会出现「结果全在、勾全没了」→ 手快就把没复核的候选送审）。同一页面上语义不同的两次
+  调用用**不同任务键**（否则第二次 `startTask` 清空第一次）。分批任务包在**一次** run 里（否则侧栏那格"转一下停一下"）。
+  `getSnapshot` 返回稳定引用（idle 记录写进表里），派生集合返回**字符串**而非 Set。
+- **`run(fn)` 只负责跑、不代存结果**：页面卸载后结果存亡取决于你是否 `setResult()`。批量打磨曾漏这步（「切页回来结果
+  卡是空的」）。凡是「跑完要留着看」的，成功分支必须 `setResult(...)`、失败分支 `setResult(null)`。
+- **能中止的长任务把 `AbortSignal` 一路传下去**：`AgentContext.signal?`，`useAgent.execute` 传
+  `abortRef.current?.signal`；`runPolish` 这类循环每轮开头查 `ctx.signal?.aborted`，别只把按钮画成停的样子。
+- **「连点好几下」和「同一任务不叠着跑」是两件相反的事**：`useAITask.run()` 同 key 在跑返回 `null`（防两发互覆盖）
+  —— 单发对，但连点三条时**后两条静默消失**。要「点几下排几件」走 `state/jobQueue.ts`（串行 `CONCURRENCY=1`、
+  可撤单、可重试）。**队列是通用设施、不许认识业务**（名字由发起它的功能给）。**拦截做在入队之前**（不是排上再撤，
+  那样作者会看见一件本不该出现的事）；排进队列的活儿带 `navKey`（`useLiveJobNavs()` 给侧栏那一下转圈）。
+- **做判断读队列模块本身，显示才读 React 快照**：一口气连点三下全发生在重渲染**之前** → 拿 `useJobs()` 快照判
+  「在不在排队」会一律判「没有」（真踩过：连点 4 下排上 4 件）。`hasLiveJobPrefix()`/`hasLiveJob()` 直读内部表；
+  快照只决定转圈与禁用。
+- **入队前按下快照，写回时用最新那份**：队列里的活儿**过一会儿**才跑，闭包里的 `store` 已旧 → **读**（内容/条目/分类）
+  按入队那刻走（作者意图）；**写**（`pushReview`/`acceptReview`）必须打在当下这份库上。用 `const liveStore =
+  useRef(store); useEffect(() => { liveStore.current = store })`。落库前**再对一次账**（排队期间别处改过/被删的条目重判）。
+  两处对账各有对手：任务内对「模型输出 vs 送进去的快照」、落库前对「快照 vs 当下的库」。
+- **撤单要连着「一个请求都不发」一起验**（撤单唯一值钱的地方）。`e2e-queue.mjs` 用假上游 `byBranch` 计数盯。
+- **批量打磨要比单条扩写更克制**（`runPolish`）：作者要连审十几条，把原文整段重写让他白审是最大浪费。提示词第一条
+  纪律是「能不动就不动」；`changes` 为空的**不入队**但记 skipped 如实报。**「无需改动」是结论、「答非所问」是没读懂，
+  必须分开**：JSON 既无 `content` 也无 `summary` → 抛 `ai.err.shapeMismatch`，**不许退化成「无需改动」**。同批提议
+  共用 `ReviewItem.batchId`（审查页据此归组「采纳这一批」）。`startBatch` 先跳过已有待审 `update-entry` 的目标
+  （避免同一目标两份打架的修订）。
+- **一次产很多份提议先按「目标」归并再发请求**（一致性页「全部生成修订方案」）：同一目标叠三条问题时连改三遍会让
+  后一次推翻前一次 → 作者拿到三份互相打架的方案；合成**一次**请求（`consistencyFixMany` + `consistencyFixItem`
+  逐块列出）。副产品同样重要：**每条修订只占队列一个位置**。`planFixes()` 按目标分组，`fixTargetOf()` 取「第一个
+  **还在库里**的相关条目」（死取 `relatedEntryIds[0]` 时相关条目一被删，旧代码安静地什么都不做，作者只看到「没反应」）。
+  施工图会被自己推出去的提议污染（那些提议目标就是图上条目，第二圈渲染当「已有待审修订」、条数一路掉）→ 用状态记住
+  **本次批号**排除自己产出，**跑完置回 null**（不置回下一轮会永久豁免，等于叠第二份修订）。
+- **一批活儿交给队列后，界面上别再存一份它的状态**：批量打磨原先前 inline 跑（进度条长在面板上、结果卡留
+  `useState`），代价是**人得守着这一页**。改 `enqueueJobs()` 后面板那行进度是**现算**的（`useJobs()` 摘这批活儿、
+  `store.review` 按 `batchId` 数送审条数）。**另存一份就得操心它什么时候和队列说的不一样，而它迟早会不一样。**
+- **「一次 AI 排版」是一条提议、不是 N 条**（`timeline-layout`，整张方案存 `ReviewItem.layoutDraft`）。拆成 N 条
+  `update-entry` 会丢掉**这几条之间的先后**（作者真正要审的正是「这一整套顺序」）。采纳时逐条走 `setEntryTime`
+  （唯一写入口 → 每条各留撤销），**不给这个 kind 补汇总日志**（退不回去的假账）。**AI 只写位置，不碰作者写的
+  时间文字**（只写 `at`/`era`/`weight`，`from`/`to` 一字不动）。
+- **agent 的写操作一律产出「提议」进审查队列、不许直接落库**（`propose()` 造 `ReviewItem`，`origin:'agent'`、
+  `rationale = ctx.why`）。三档边界管「动作要不要先问」，**管不到产出要不要审** —— 「直接执行」档也照样进队列。
+  撤销提议要**连带撤回**挂在它上面、依赖它的关系提议；采纳关系提议前两端必须都已落地（否则图谱上会有断头线），
+  应用层与 store 各一道守卫。`acceptReview` 的 follow 用**双向匹配**（`fromEntryId`/`toEntryId` 都要比）。
+
+## 6. 假上游与 e2e 纪律
+
+- **同一套 e2e 绝不许并发跑两轮**：共用同一个假上游（`/__mock-stats` 计数被对方 reset/分走）且**同源**（两个无头
+  浏览器共用一份 IndexedDB、互改数据）。特征好认：**只有依赖假上游计数或共享库的用例红，且是「数目不对」不是
+  「抛异常」**。发现两个循环并存先 `TaskStop` 一个再单独重跑红的。
+- **`stats` 跨脚本累加** → 跑前 `GET /__mock-stats/reset` 归零；失败时把落 `unknown` 的请求片段打进 detail，别只报条数。
+  **`/__mock-delay` 是跨脚本共享的服务端状态，比 stats 更阴**（延迟**真改回包时序**）：设过的脚本收尾打 `?ms=0`，
+  不需要延迟的脚本开跑前也显式归零。（`e2e-queue` 曾设 900ms 不还原，`e2e-onboarding` 无辜受害且红的方式指不到真凶。）
+- **假上游不发 CORS 头是设计内的路径**（直连被拦 → 自动走 `/__wf-proxy`），所以**每次 AI 调用都留两条 CORS 报错**。
+  断言「没有 error 级日志」必须按 `blocked by CORS policy|net::ERR_FAILED` + mock host 放行。**反过来**：
+  `e2e-onboarding` 专门断言那些 CORS 日志存在（验跨域兜底），所以它要求假上游**不带** `--cors`；需要浏览器直连的
+  其它脚本要带 `--cors`（协议面 `/v1/chat/completions`、`/v1/models` 按它走）。
+- **`/__mock-*` 控制端点永远带 CORS 头、不受 `--cors` 影响**（脚本从页面里发，跨端口就是跨域）。
+- **改了 `mock-upstream.mjs` / `server.mjs` 必须重启进程**（常驻 node 不热加载）。症状极有指向性：回执里出现
+  「没有这个工具: xxx」且工具名是上一版才有的。**起常驻服务用 `run_in_background`**，`( node ... & )` 会随那次
+  Bash 调用被回收（表现为「请求全失败、页面一动不动」）。沙箱会拦端口绑定（WinError 10013）→ 本地起服务/验端口要
+  `dangerouslyDisableSandbox: true` + `curl --noproxy '*'`。
+- **分派触发词是「世界名」时必须和这条任务自己的形状标记一起判**：世界名出现在这个世界的**所有**提示词里
+  （expand/polish 的 `{worldBrief}` 都带着它），只认世界名的话同世界随后跑的别的任务会被截胡 —— 真实翻车：一致性
+  审计过了、紧接着「生成修订」被 `consistency-many` 截走收到 `issues` 列表 → 产出的修订正好等于原文（看起来像
+  「AI 一个字都没改」）。修法：`has('多修订标记') && has('"issues"')`。另一半：**让假回包把收到的问题原样写回正文**
+  （「合并有没有静默丢问题」光看条数看不出来，只有回写才能证实发过去的是哪几条）。
+- **agent 调度只看最后一条用户消息**（`ctx.lastUser`），不能扫整份 transcript（`AGENT_RESULT_MARK`/`REPAIR_MARK` 会
+  **留在历史里**、之后每轮都带着）。**镜像坑**：`last.includes(AGENT_RESULT_MARK)` 也不能区分「第几轮」（第二轮起
+  一直为真）。**多轮场景按「已说完几轮」（`ctx.turns` = assistant 消息条数）分步**，不要数「回灌过几句结果」
+  （护栏插话/纠正指令是 user 消息**不占** `ctx.turns`；一个批次失败三次会把回灌句数顶多）。
+- **看不见的东西没法断言，先把它变成看得见的**：
+  - `stats.marks` 数**护栏插话**出现过没有（那两句只在历史消息里、界面不渲染）。它答不了「第几轮」→ 另加
+    `stats.agentTurns`（最多 40 条）：每次请求记下**这一轮带哪句插话**与**最后一条用户消息的尾巴**，控制台印
+    `turns=3 nudge=todoNudge`。
+  - `stats.history`（跨轮记忆的眼睛）：记最近一次请求里「我们之前聊过」那段的 `chars` + 开头 400 字（只发给模型、
+    界面一个字不渲染）；`AGENT_MARKS.historyHeading` 顺带回个计数。
+  - `stats.lastBody`（剥掉 `messages`）+ `lastHeaders` + `lastMessageCount` + `chatCount`：设置页开关「带没带」
+    端到端才验得到。
+- **假上游分支要有形状标记，别靠世界名**：`polish` 分支按正文长度回包（`畸形打磨` → 无预期字段的 JSON；≥200 字 →
+  原样返回；否则补 `## 打磨补充`），且**排在 expand 判定之前**（否则被当扩写）。**排版分支（`timeline-layout`）
+  是双向的**：判据是它自己的 JSON 形状（`"layout"` + `"toAt"`），第一次给刻意用 111/222/333 的方案（与轴上小整数必
+  不同 → 「这是真改动」不靠碰运气），第二次起 `layoutEcho()` 把刚读到的现状**原样回**（于是应用算出「零处改动」）；
+  它读回提示词里的轴行（`parseAxisLines`，中英两格式都认），条数记 `stats.layoutParsed`。
+  **`suggest`/`suggest-answers` 按调用次数轮换批次**（好断言「内容真换了」而不只是「有请求发出」）。
+- **导航项合并/改名会让 `.dev/` 里每一个 `goRoute('旧key')` 当场炸**：它们都是 `document.querySelector('[data-role=
+  nav-<key>]').click()`，拿不到元素就是 `TypeError: Cannot read properties of null`，红在「页面执行出错」里、指不到
+  「导航改了」。Wiki 合并把 `entries`/`pieces` 收进 `wiki` 后，`e2e-consist`/`e2e-queue`/`e2e-polish`/`e2e-ai-bg`
+  四支各红一处。修法是让 `goRoute` 自己认识子页（先点 `nav-wiki`、再点 `wiki-tab-<子页>`）。**同理**：写死的页标题
+  断言（`.page-title === '条目库'`）也要跟着改。**合导航之后跑一遍全量 e2e，别只跑新页那一支。**
+- **e2e 选择器与等待**：
+  - ①按**唯一标识**挑，别用 `textContent.includes`（曾用 `includes('水位线换算')` 挑审查卡，却选中标题「水位线换算
+    → 涨潮纪」的关系卡、其采纳按钮被禁用 → 假 `blocked`）→ 用标题节点精确匹配 + 给标题补 `data-role`。
+  - ②**别动共享 `data-*` 钩子**（`data-role`/`data-node`/`data-link`）；新增交互入口顺手加 `data-role`。
+  - ③**读「展开才渲染的面板」前必须先展开**（收起时行不在 DOM，直接读得空串 → 以「什么都没排上」的形状失败）。
+  - ④**sweep 只检查能否渲染、从不点按钮** —— 「点一下才跑」的 AI 链路不在它覆盖里，给这类按钮补 `data-role`
+    （`consist-audit`/`consist-fix`/`consist-stat`/`graph-ai-recommend`）。
+  - ⑤**等待条件不能是「body 里有没有某几个字」**：工作台右栏工具清单本来就一字不差印着「新建条目」「看时间轴」，
+    条件**开局就成立** → 抢在真正落库前往下走，后面全红且像功能坏了（假绿过一整轮）。要等就等**执行记录**
+    （`[data-role=agent-step].done` 的**增量**）或轮询库状态。**「固定 sleep 再读库」可能假红，「body 里有没有这几个
+    字」可能假绿。** 断言看**增量**（整页里前面几十节回合都还在，整页搜会搜到老回合）。
+  - ⑥**点完「发送」不能立刻 `waitFor('[data-role=agent-send]')`**：React 换「发送」→「停下」要过一帧，那一瞬「发送」
+    还在 DOM → 等待在**开跑之前**返回，紧接读到的统计只含第一个请求。姿势：先等**只有跑起来才有**的状态
+    （`agent-abort` 出现）再等变回发送键（`awaitAgentDone()`）；抓中间态用带返回值的 `waitValue()`。
+  - ⑦**断言「某分支生效」要断内容**（那句特有的话），不能只断「有没有答复/弹卡」。脚手架等待**必须断言结果**
+    （`await waitFor(...)` 不接返回值等于没等）；超时抛错带上关键 DOM 状态。`type()` 注入前先等元素可交互
+    （agent 跑着时输入框 `disabled`，React 会丢弃 disabled 元素上的输入事件）。**建议按钮（`agent-next-item`）点一下
+    就会真跑一轮**，点完要么 `awaitAgentDone()` 要么按「停下」收干净。
+  - ⑧**`Page.navigate` 到只差一个 hash 的 URL 是同文档导航、不重载** → 预置 localStorage/IndexedDB 后必须
+    `Page.reload`（否则一直停在引导页，很容易误判成功能坏了）。
+- **无头 Chrome 里 `el.blur()` 什么都不发生**，自造 `new Event('blur')` 也不顶用。验「失焦才落库」必须派
+  `new FocusEvent('focusout', { bubbles: true })`（`textarea` 用 `HTMLTextAreaElement.prototype` 的 value setter）。
+- **「按下后才挂监听」的拖拽会丢最初位移**（`useEffect([dragging])` 比 `mousedown` 晚一渲染周期）→ 在 `onMouseDown`
+  里**就地** `addEventListener`、松手 `removeEventListener`。**「拖」和「点」的判别要在 `mouseup` 那一刻一次判完**
+  （用 ref 记到随后的 click，那条 click 会被永久吃掉）：落在轴上→落位；没落轴上且指针几乎没动（<4px）→ 当点击。
+  `onClick` 只处理 `e.detail === 0`（键盘 Enter/Space）。**一次 `evaluate` 只做一件事**（mousedown+mousemove+读 DOM
+  塞进同一同步 evaluate，React 还没提交这一帧 → 全红假警），拖动拆成四次 evaluate 中间各 sleep；`evaluate` 抛错时
+  把出错表达式原样打出来。
+- **「节点不重叠」≠「标签不重叠」**：SVG 按固定像素分槽能让圆点分开，名字十几个字宽照样叠。摆位按**标签估算宽度做
+  首次适配**（汉字 ≈11.5px、其余 ≈6.2px），**参与占位的只算「默认会显示」的标签**（把悬停/选中也算进去，鼠标一划整条
+  轴就跳）。断言用 `getBBox()` 两两相交判定，别靠肉眼看截图。
+
+## 7. 设置页 / 接入厂商
+
+- **型号清单要「去拉」不是写死**：OpenAI 兼容厂商都有 `GET {baseUrl}/models`。内置清单降级为**兜底**
+  （`fallbackModels`），点「选型号」拉真清单、缓存本机（`worldforge:models:<provider>@<baseUrl>`），面板打开自动拉
+  一次、重开不重拉、只有点「重新获取」才再拉。**型号永远可手填**。解析认全形状（`{data}`/`{models}`/`{model_list}`/
+  裸数组；条目是字符串或 `{id|model|name|model_id}`）；排序「能对话的在前 + 有 `created` 的新在前 + **没给 `created`
+  就保持厂商原顺序**（稳定）」；向量/语音那类**标一句挪后面，不许藏**。
+- **切服务商要记「这家挑过的」**：`modelByProvider` + `baseUrlByProvider`（**只记和官方不一样的地址** —— 把预设指向
+  中转站是国内常见用法，不记的话「切去别家看一眼再切回来」会静默还原官方地址）。配「恢复官方地址」。新家没自带地址
+  （「自定义」）时**不要写 `baseUrl`**（会抹掉作者填的网关地址）。
+- **新增设置项一律写成可选字段**（设置是 localStorage 整块 JSON，老版本没新键；载入时
+  `{...DEFAULT_AI_SETTINGS, ...parsed.ai}` 合并），读时按「没设过 = 用默认」（`ai.stream !== false`）。
+- **请求体构造抽成纯函数（`buildChatBody`）**，否则开关没法验（「设置页勾了」存进 localStorage 算成功，**请求里带没带
+  完全是另一回事**）。`buildChatBody`/`readExtras`/`mergeHeaders`/`shouldStream` 由 `unit-ai-config.mjs` 逐条钉。
+  判据：本次调用的 `maxTokens` 优先于设置里的；`top_p === 1`/`maxTokens === 0` 视为「没设」**不传**；`messages`
+  **不许被额外请求体覆盖**；请求头同名字段不分大小写覆盖。
+- **`response_format` 三态（`auto`/`always`/`never`）**：网关不认这字段时一律 400（要 `never`），有的自建网关只在
+  明确要 JSON 时才吐利索（要 `always`）。
+- **手写 JSON（额外请求头/请求体）要「就地报红 + 发送前拦下」**：`parseExtraObject` 的结果既给界面即时提示也给发送前
+  把关；空栏**不算错**；报错点名**哪一栏、错在哪**。**存文本不存对象**（敲一半不是合法 JSON）。
+- **本机转发器（`tools/local-proxy.mjs`）必须原样转发额外请求头**：原先把头**重建**成四个 → 同一配置**直连能用、
+  一退回转发就悄悄没了**，厂商只回「参数不对」（极难查）。改成「滤掉浏览器自带的（`Origin`/`Referer`/`Sec-*`/
+  `Accept-Encoding`）与逐跳头，其余一律转发」。`e2e-ai-config.mjs` 要两种启动参数各跑一次。
+- **新增一处配置项要同时问三个问题**：①真进请求了吗（纯函数单测）②走了另一条路（本机转发）还在吗（无 `--cors` 那趟
+  e2e）③界面说得清它是干什么的吗（`ai.*` 孤儿键扫描）。
+
+## 8. 界面 / 关键文件
+
+- i18n：`core.ts`（清单/偏好 `worldforge:locale`/浏览器探测）/ `translate.ts`（`translate`/`tGlobal`/`MsgKey`/插值）/
+  `index.tsx`（`I18nProvider` + `useT`）/ `locales/{zh,en}/`（按模块拆）
+- 提示词：`ai/promptText/{zh,en}.ts` **正文**（体量大单放，`pt(key, params)` 取用）+ `ai/prompts.ts` **组装层**
+  （只填占位符）；`POLISH_FOCUS`/`FOCUS_TEMPLATE`（漏键 tsc 报）
+- `ai/tasks.ts` 各任务「调用+解析」；顶部 `requireList()` 是**严格取列表**出口。`buildUpdateProposal()`（单条扩写与
+  批量打磨**共用**）与 `relationProposals()` 是两条修订路径的公共底座（改一处两处一起变）；`runPolish()` 批量打磨
+- `ai/parse.ts` `extractJson`/`asArray`/`hasListShape`；`LIST_KEYS` 是与提示词形状的**契约**。
+  `ai/consist.ts` 账本（`buildLedger`/`touchedSince`/`splitDuplicates`）
+- `storage/indexeddb.ts` 本地库适配器（顶部注释记 open/升级阻塞的坑，改前先读）；`lib/diagLog.ts` 启动诊断
+- `state/store.tsx` 全局状态 + 落库默认值（默认值也走 `tGlobal('lib.state.*')`）+ 操作日志与撤销
+- `state/aiTasks.ts` 模块级 AI 任务表（`useSyncExternalStore`）；`AITask.progress` 承载 `{done,total,label}`；
+  `aiGuardKey(ai)` 是 **AI 配置齐没齐的唯一判据**（三处共用，别各写一份）
+- `state/jobQueue.ts` 通用队列：`enqueueJob`/`cancelJob`/`retryJob`/`clearFinishedJobs`/`useJobs`/`hasLiveJob(Prefix)`/
+  `useLiveJobNavs`。跑法 `run(signal)` 存另一个 Map、**不进 React 快照**；成功可返回人话回执（`note`）；失败**不堵队列**、
+  保留跑法以便重试。`Job.navKey` = 算在哪格导航上
+- `components/TaskDock.tsx` 右下角胶囊（挂 `Shell`、切页不丢）；世界隔离规矩「跑着的照显、别的世界跑完的不显」
+- `state/useAgent.ts` 工作台 agent 执行循环；`ai/agent/` 三件套 `tools.ts`（工具 + `AgentTool.args` 参数契约 +
+  `normalizeArgs`/`checkRequired`，**唯一写库入口**）/ `protocol.ts`（`{say, plan}`）/ `prompts.ts`（系统提示词编排）
+- `pages/GraphPage.tsx` 关系图（力导向+直接编辑+「轻重」刻度）；时间轴 `components/TimeAxis.tsx`（右手边「还没排进去」
+  = `entries.filter(e => !e.time)`）。**`view` 提升到 `App.graphView`**（agent 说「去时间轴」才落到那一支：
+  `resolveAgentPage('timeline')` → `{page:'graph', view:'time'}`）。派生 `store.timedEntries`；导出作大事记
+- `types.ts`：`ReviewItem.batchId?` 是审查页「同批归组/采纳这一批」的唯一依据；`Entry.time?` 见 §2.1
+- **`components/MarkdownView.tsx`：`#` 留给了页面标题**（`level = Math.min(h[1].length + 1, 6)`），所以正文里写的
+  `## 概览` 落成 **`<h3>`**，`######` 夹到 `h6`（别吐 `<h7>`）。写「正文里有 h2」这类断言或样式选择器时别猜错级别
+  （e2e-wiki 曾因此红了一条，看着像「知识库排版没生效」，其实 `.md.wiki` 那套 h2/h3 都覆盖到了）。
+- `lib/wiki.ts` Wiki 陈列层的派生数据（纯函数：摘录 / 筛选 / **稳定排序** / 牵连数 / 双向关联 / 来源 / 内链目标）；
+  `lib/markdown.ts` 的 `outlineOf()` 是「认 Markdown」那一层（只认 ATX，**不认 setext** —— `---` 在本项目里是分隔线）
+- **Wiki 一页三支**：`pages/WikiPage.tsx`（`WikiView = 'display' | 'entries' | 'pieces'`）+ `#entries`/`#pieces`
+  两个老地址别名；`EntriesPage`/`PiecesPage` 以 `embedded` 嵌入（**不重复页标题、但按钮与 `data-role` 一个不动**）。
+- **Wiki 的「阅读」支 = 三栏百科版式（左目录 / 中正文 / 右信息栏），不是卡片墙**。用户明确纠正过一次：「只想要杂物间是
+  瀑布卡片，wiki 页要像一个 wiki 一样的页面」。条目是文章，把它压成 300px 宽的卡片等于让作者隔着针眼看自己写的东西。
+  - 左 `.wk-nav` 是**按分类分组**的目录（组顺序照 `store.categories`），排序只决定**组内**先后 —— 写排序断言/改排序
+    逻辑时别忘了这一层：拿整个目录去比全局序列会被分组切开，看着特别像「排序没生效」。
+  - `.wk-infobox` 是信息栏（目录 / 关联 / 字段 / 来源 / 元信息）。**不再是 Modal**，所以没有 `.modal-close` 可点。
+  - `shown = reading ?? list[0].id`：**挑过就锁定**（搜索/筛选不把正在读的那篇挤走）；点目录也 push `trail`
+    （上限 30），「返回」指名道姓写回哪一条。
+- **杂物间才是瀑布流**：`.pz-grid` 用 CSS 多列（`column-width` + `break-inside: avoid`），**不是 grid** —— grid 会把
+  同一行的卡片拉平。卡片高矮得**真的参差**才有意义（图片用 `<img>` 自己撑高、文本带预览、标题允许两行）。阅读顺序按列
+  → **排序必须稳定**（三档都以标题兜底）。
+- `StatusPill` 渲染成 `<span class="pill {status}">已定稿</span>`，**没有 `data-status`**；那个钩子只在目录项
+  （`wiki-nav-item`）上。断言按文案认，别按属性认。
+- 正文编辑器那一路（`lib/wikitext.ts` + `components/WikiEditor.tsx` + `components/EntryEditor.tsx`）见 §10。
+
+## 9. 正文编辑器（「写」的那一半）
+
+`pages/WikiPage.tsx` 的「编辑」支 → `EntriesPage` → `components/EntryEditor.tsx`（外壳：元信息/字段/关联/时间四个
+页签、分栏预览、编辑摘要、草稿）→ `components/WikiEditor.tsx`（正文编辑器）。纯函数层在 `lib/wikitext.ts`。
+
+- **底色是真的 `<textarea>`**，不是 contenteditable —— 后者会丢掉输入法、原生撤销栈（Ctrl+Z）、选区、拖拽选词、
+  无障碍，中文输入法尤其容易炸。语法上色只**盖在底下一层彩色副本**，文字仍由 textarea 提供（它的 `color: transparent`）。
+- **副本与输入框对齐的三个死条件**：① 字体度量完全一致 —— 两层共用**同一个 class**（`.wxe-font`）承载，而不是两处
+  各写一份靠「记得同步改」；② 换行规则一致（`pre-wrap` + `break-word` 两边都给）；③ 盒模型一致（边框与内边距一样，
+  副本那层边框是透明的只为占位）。
+- **上色纪律：副本里只许改 `color` / `background` / `text-decoration`。** 一旦加 `font-weight: 700` 或
+  `font-style: italic`，那段字就比输入框里同位置的字更宽 → 副本自己先折行 → 从那一行往下全错开。它错开的样子非常像
+  「字体没加载好」，很难往「字重」上想。「加粗的正文」在预览里看，在这儿只上色。
+- **输入法组字期间必须把文字颜色还回去**并隐藏副本（`.wxe-stage.composing`）：未上屏的那串拼音是浏览器直接画在
+  textarea 里的，透明就等于「打字的时候看不见」。两层度量一致，切换无跳动。
+- **`highlightMarkdown` 的硬约束：段拼起来逐字符等于原文**（含换行）。断言这条比断言「哪些段上了色」更要紧 —— 少/多
+  一个字符就一路偏到底，而偏的那一个往往是最不起眼的换行。段上带 `line`，章节跳转靠它定位。
+- **行内扫描器不能「没匹配就收工」**：`这是**粗体**` 的第一个字不是标记开头，一收工整行全成纯文本。要跳到下一个可能
+  的起始字符（`[*~`[_]`），中间那截一次性当纯文本吐掉。用粘性正则（`y`）逐格推进，别用 `.replace()` 链（那会把已吐出的
+  文字再揉一遍，对不上原文）。
+- **工具栏动作的「族」由纯函数层统一 export**（`PREFIX_MARK`）：无序与有序**共用一个 mark**，否则「点有序列表」会把
+  无序叠成 `1. - x`。**缩进单独算**（前缀加在缩进之后、脱掉时还回去），否则「取消列表」会把作者的嵌套层级一起吃掉。
+  取消/切换以族为单位，不能让调用方各写各的正则。`specOf(key)` 要**按 key 取工具**而不是按下标（下标一改就串）。
+- **浮层要断言「看得见」，不能只断言「元素存在」**。候选面板钉在编辑区左下角、编辑区 320 高，在弹窗里这位置常常落在
+  可视区外 —— DOM 查询一切正常、截图里却像「什么都没弹」。修法 `scrollIntoView({block:'nearest'})`（已可见就不动，
+  不跟输入抢滚动）+ 断言量 `getBoundingClientRect` 与 `innerHeight`。
+- **内链候选「一个都不匹配」时要说话**（`wxe-suggest-none`），但「刚打完 `[[` 一个字没写」时不吭声（那是噪音）。
+  候选里要排掉自己（`selfId`）。面板用 `onMouseDown` 而不是 `onClick`：click 会先让输入框失焦、候选就先没了。
+- **编辑摘要的落点是 `logOp.detail`**，不给 `Entry` 加字段：`updateEntry(id, patch, detail?)` 第三个参数进日志，
+  活动日志页本来就把 `detail` 渲染成「理由：…」。
+- **草稿三条纪律**：① 存 localStorage 不进库（临时物，保存成功即清；进库会在备份/导出里留半成品）；② 重开时**不自动
+  套用**，摆一条「恢复 / 丢弃」—— 自动套上去 = 静默改数据，比丢草稿更难查；③ 关闭前的 confirm 措辞必须写清
+  「取消 = 草稿留着」，否则作者以为两条路都危险、只能硬猜。`dirty` 才写（打开看一眼又切走不该平白多出一份），防抖 700ms。
+- **三态模式（`edit`/`split`/`preview`）取代了原来的「预览」开关**，选择记进 localStorage（`MODE_KEY`）。
+  预览层与阅读页**共用 `<MarkdownView className="wiki">`**（同一套排版，别另写一份）。
+
+## 10. 验证工具与环境坑（`.dev/`，不参与构建）
+
+- `i18n-coverage.mjs` 静态扫硬编码文案（自写扫描器去掉注释与**正则字面量**；行尾 `// i18n-allow` 放行）；
+  `sweep.mjs` 全页巡检（16 页）；`shot.mjs` 单页截图。
+- 单测：`unit-prompts` / `unit-parse`(30) / `unit-consist`(31，专盯「判重太紧」，含一条**故意反向**的断言「换个说法
+  认不出来」，改判重规则前先看这节) / `unit-args`(61，编 `tools.ts` 要带 `--jsx react-jsx --types vite/client --lib
+  dom`，静态扫工具块在 `^  },$` 处截断) / `unit-agent-protocol`(22，**真实模型必然变形、假上游永远吐标准格式，
+  「模型没照格式回」只能靠它盯**) / `unit-agent-prompt`（纯文本比对，守中英逐键对齐 + 无孤儿键）/ `unit-ai-config` /
+  `unit-wiki` / `unit-wikitext`(84，含「高亮逐字符守恒」13 例)。
+- e2e：`e2e-i18n` / `e2e-onboarding`（**不带** `--cors`）/ `e2e-pieces`(11) / `e2e-docs`(17) / `e2e-blocked-db`(9) /
+  `e2e-timeout-db`(15) / `e2e-graph`(58) / `e2e-wiki`(58) / `e2e-wiki-edit`(63) / `e2e-studio-agent`(126) /
+  `e2e-timeline`(135，无需假上游) / `e2e-ai-bg`(16) / `e2e-consist`(77) / `e2e-queue`(34) / `e2e-polish`(46) /
+  `e2e-agent-args`(22) / `e2e-ob-suggest`(12) / `e2e-ai-config`(58，两种启动参数各一次)。
+- `e2e-blocked-db.mjs` 顶部 `DB_VERSION` 要与 `src/storage/indexeddb.ts` 同步；读 store 清单**必须用不带版本号的
+  `open()`**（带低版本号开已升级的库会抛 VersionError）。
+- **`unit-*.mjs` 开头 `rmSync(OUT)` 必须吞错**：`node-safe-delete-shim` 拦 `rmSync` —— **目录里文件数 > 50** 就抛
+  `SAFE_DELETE_BULK_CONFIRM_REQUIRED`、压根不删。`tsc` 编一次 `unit-parse`/`unit-agent-protocol` 正好产出 **55/56** 个
+  文件 → 这些临时目录**从第二次运行起永远删不掉**，脚本第一行当场死（末行只剩 `Node.js v22.22.2`，看着像「三个单测
+  全崩」，其实一条断言都没跑）。四个脚本都包了 try/catch（**删不掉不影响正确性，tsc 会覆写自己的 `.js`**）。要真清走
+  bash `rm -rf`。**别把「清理失败」当结论**，看到那个末行先单独重跑。**收尾清 `.tmp-*` 偶发 EPERM/EBUSY**（Windows
+  手柄没放）：断言其实全过却让退出码变 1 → 清理必须 try/catch 吞掉。
+- **safe-delete 有「按回合累计」的删除额度**：删得多了 `npm run build` 的「清空 dist」会被拦（报的 `count` 是**这一整
+  回合的累计数**）。所以**「先跑几个单测、再构建」会翻车**（单测 `.tmp-*` 清理先吃额度）。要么先构建后跑单测，要么构建
+  前手动清 `dist`。伪装得很像「vite 坏了」。
+- 单测脚本各自用不同 `tsc` 参数编同一份源码 → **源码别依赖只有 `--strict` 才成立的类型收窄**（`ExtraParse` 靠
+  `if (!x.ok)` 收窄，应用 OK 但 `unit-parse` 没带 `--strictNullChecks` 就在 `client.ts` 报「属性不存在」—— 报错长在
+  源码上、看着像源码坏了）。修法是**两个分支上都声明**。汇总行格式不一（`单元验证（parse）：30/30 通过。` vs
+  `结果：N/M 通过`），**批量跑单测 grep 要宽**。
+- `e2e-timeout-db.mjs` 的「数据库清单看到 worldforge@v1」偶发失败（`indexedDB.databases()` 3s 超时），重跑即过。
+- **Bash 工具会拦端口绑定**（WinError 10013「以访问权限不允许的方式」）→ 起服务/验本地端口要
+  `dangerouslyDisableSandbox: true`；另因沙箱代理（`http_proxy=127.0.0.1:50421` → 502）读本地端口要 `curl --noproxy '*'`。
+- **起服务的正确姿势**：`python -m http.server 5188 --directory dist --bind 127.0.0.1`（静态）+ `node
+  .dev/mock-upstream.mjs 5190 --cors`（假上游），都用 `run_in_background`。e2e 默认打 `http://127.0.0.1:5188/`、
+  baseUrl `http://127.0.0.1:5190/v1`。

@@ -1,0 +1,199 @@
+# WorldForge 界面与验证须知（速查·第二册）
+
+> 本文是 `MEMORY.md` 的**第二册**。`MEMORY.md` 每次会话整份注入，所以只留跨界的核心铁律；
+> 界面 / e2e / 设置页 / 正文编辑器 / 验证工具这几节（§6–§10）篇幅大、又只在动到那一块时才用得上，搬到这里。
+> AI 那三节（§3–§5）同理搬在 **`MEMORY-ai.md`**。
+> **编号与 `MEMORY.md`、`MEMORY-ai.md`、`CASES.md` 完全一致**，动到对应板块前**先读本节**（以及 `CASES.md` 的同号小节）。
+
+## 6. 假上游与 e2e 纪律
+
+- **同一套 e2e 绝不许并发跑两轮**（共用假上游计数 + 同源 IndexedDB）。特征：只有依赖计数或共享库的用例红。
+- **跑前 `GET /__mock-stats/reset` 归零**；**`/__mock-delay` 也要显式归零**（共享的服务端状态，比 stats 更阴）。
+- **假上游不发 CORS 头是设计内的路径**（自动走 `/__wf-proxy`）→ 每次 AI 调用留两条 CORS 报错；断言「没有 error 级日志」
+  要放行 `blocked by CORS policy|net::ERR_FAILED` + mock host。
+- **反过来**：`e2e-onboarding` 要求假上游**不带** `--cors`（要浏览器直连的脚本才带）。
+- **分派触发词是「世界名」时必须和这条任务自己的形状标记一起判**（`has('多修订标记') && has('"issues"')`），否则同世界
+  随后跑的别的任务会被截胡。**让假回包把收到的问题原样写回正文**（才验得出有没有静默丢问题）。
+- **假上游各分支要有自己的形状标记**：`polish` 按正文长度回包且**排在 expand 判定之前**；`timeline-layout` **双向**
+  （第一次给刻意不同的值、第二次 `layoutEcho()` 原样回 → 应用算出「零处改动」）；`suggest*` **按调用次数轮换批次**。
+- **agent 调度只看最后一条用户消息**（`ctx.lastUser`）。**多轮场景按 `ctx.turns` 分步**，不要数「回灌过几句结果」。
+- **看不见的东西没法断言，先把它变成看得见的**：`stats.marks`/`agentTurns`/`history`/`lastBody`/`lastHeaders`/`chatCount`。
+- **探测类批量请求必须单独计数**（`probeCount`/`probeModels`/`probeLastBody`）；**分派块要摆在记 `lastBody`/`chatCount` 之前**。
+  探测请求的**形状就是它的身份**：一条 user 消息、`ping`、`max_tokens: 1`。
+- **socket 直断（`res.destroy()`）不能用来数请求次数**（浏览器会自动重发）→ 要数次数就回**真的 HTTP 错误**。
+- **导航项合并/改名会让 `.dev/` 里每个 `goRoute('旧key')` 当场炸** → 让 `goRoute` 认识子页，**合导航后跑全量 e2e**。
+- **e2e 选择器与等待**：
+  - ①按**唯一标识**挑，别用 `textContent.includes` → 标题节点精确匹配 + 补 `data-role`。
+  - ②别动共享 `data-*` 钩子（`data-role`/`data-node`/`data-link`）；新交互入口顺手加 `data-role`。
+  - ③读「展开才渲染的面板」前必须先展开。
+  - ④**sweep 只渲染、从不点按钮** → 「点一下才跑」的按钮要补 `data-role`（`consist-audit`/`graph-ai-recommend`…）。
+  - ⑤**等待条件不能是「body 里有没有某几个字」**（可能开局就成立 → 假绿）；要等**执行记录的增量**或轮询库状态。
+  - ⑥点完「发送」先等 `agent-abort` 出现，再等 `awaitAgentDone()`（不能立刻等 `agent-send`）。
+  - ⑦**断言「某分支生效」要断内容**；`await waitFor(...)` 必须接返回值；`type()` 前先等元素可交互。
+  - ⑧**`Page.navigate` 到只差一个 hash 的 URL 是同文档导航** → 预置数据后必须 `Page.reload`。
+  - ⑨往受控 `textarea`/`input` 塞值**必须走原生 setter 再派发 `input`**；⑩整页重载要重新注入 `window` 上的小工具。
+  - ⑪**小元素/浮层要断「真的看得见」**（量 `getBoundingClientRect` 在 `innerHeight` 内），别只断「元素存在」。
+- **无头 Chrome 里 `el.blur()` 什么都不发生** → 派 `new FocusEvent('focusout', { bubbles: true })`。
+- **拖拽要在 `onMouseDown` 里就地挂监听**（`useEffect([dragging])` 晚一渲染周期会丢最初位移）；「拖」与「点」在 `mouseup`
+  一次判完；**一次 `evaluate` 只做一件事**（否则 React 还没提交这一帧 → 全红假警）。
+- **「节点不重叠」≠「标签不重叠」**：按标签估算宽度做首次适配（汉字 ≈11.5px、其余 ≈6.2px）；断言用 `getBBox()` 两两相交。
+
+## 7. 设置页 / 接入厂商
+
+- **清单上有 ≠ 用得了**：`ai/probe.ts` 自动探可用性 —— 拉完清单后直接探、打开面板有旧清单且没在探时补探、
+  **选中一个还没结论的型号时单独探它**（三处触发）。列表每项**左侧一条 3×14 的短矩形**（固定占位，否则结果回流时
+  整列文字往右跳）；**四档色**：绿=真能回话、**橙=渠道报余额/额度不足**、红=这型号有问题、灰=还没探。
+- **判据顺序**（`classifyProbe`，顺序本身就是结论）：有正文 → 鉴权词 → 余额词 → 型号词 → **网络词** → 状态码 →
+  「没状态码但有话」→ 未知。②在③前、⑤在⑥前。**`NET_RE` 要认网关那几句原话**。
+- **只有真拿到回复才算可用**：探测走 `chat()`，成功分支也要再过一遍 `classifyProbe({ content })`；
+  「2xx 但 `content` 为空」必须归 `noContent`（红），**不许当「未知」**（灰的会让作者以为可能能用）。
+- **不制造假结论**：非对话模型（`maybeNotChat`）**根本不探**；**没探完不写结论**（文案明说「仍是未知」）；
+  连着 3 条 `unreachable` 就收手。缓存 `PROBE_TTL = 24h`、键 `provider@baseUrl@fp(apiKey)`；`AbortSignal` 贯穿。
+- **上限是设置项，不是写死的 40**（`ai.probeLimit` + `ai.probeUnlimited`）。读法只有一条路：`resolveProbeLimit(settings)`
+  —— 「不限制」> 作者填的条数 > 默认值，**坏输入（0/负数/NaN）回落默认**而不是「不限制」。
+- **上限只有一个入口：选型号面板探测那一行**（设置页那份已删，两道守卫锁着）。
+- **面板里只有一种底色**（分区只靠 1px `--border`）：搜索行/探测行/上限行/图例曾各铺一块灰，作者的评价是「插着显得多余」。
+- **「现在还剩几条没结论」和「这一轮打完之后还剩几条」是两件事**（`probeCandidates().length` vs `planProbe().pending`），
+  混用会出现「还剩 5 条没探，却写着还有 3 条」。
+- **界面上的派生数字要当场算，不要存 state**（上限从 40 改成 200 后，存下来的那句变成假话）。
+- **`num` 输入框必须按字符串托管**（`draft: string | null`）：直接写 `Number(value)` 会让删空重敲时的 `NaN`/`0` 把框弹回旧值。
+- **e2e 里「重新探测」自带 `force`** → 想验「接着把剩下的补上」必须走**关掉面板再打开**；`stats.probeModels` 跨节累加。
+- **`probesRef`/`probingRef` 必须有**（回调里的 `probes` 是渲染期闭包那份）；新一轮开始前先 `abort` 上一轮；
+  收尾 `if (abortRef.current !== ac) return`；关面板/卸载都 abort。
+- **型号清单要「去拉」不是写死**（`GET {baseUrl}/models`；内置清单降级为兜底；缓存键含 provider@baseUrl）；
+  **型号永远可手填**；排序稳定（**没给 `created` 就保持厂商原顺序**）；向量/语音那类**标一句挪后面，不许藏**。
+- **切服务商要记「这家挑过的」**（`modelByProvider` + `baseUrlByProvider`，**只记和官方不一样的地址**）；新家是「自定义」时
+  **不要写 `baseUrl`**（会抹掉作者填的网关地址）。
+- **新增设置项一律写成可选字段**（载入时与默认值合并），读时按「没设过 = 用默认」。
+- **请求体构造抽成纯函数（`buildChatBody`）**，否则开关没法验。判据：本次 `maxTokens` 优先；`top_p === 1`/`maxTokens === 0`
+  视为「没设」**不传**；`messages` **不许被额外请求体覆盖**。`response_format` 三态。
+- **手写 JSON 要「就地报红 + 发送前拦下」**、空栏不算错、报错点名哪一栏哪一行；**存文本不存对象**。
+- **本机转发器（`tools/local-proxy.mjs`）必须原样转发额外请求头**；`e2e-ai-config` 两种启动参数各跑一次。
+- **新增一处配置项要同时问三个问题**：真进请求了吗（纯函数单测）/ 走本机转发还在吗 / 界面说得清它是干什么的吗。
+
+## 8. 界面 / 关键文件
+
+- i18n：`core.ts`（清单/偏好 `worldforge:locale`/浏览器探测）/ `translate.ts`（`translate`/`tGlobal`/`MsgKey`/插值）/
+  `index.tsx`（`I18nProvider`+`useT`）/ `locales/{zh,en}/`（按模块拆）。
+- 提示词：`ai/promptText/{zh,en}.ts` **正文**（`pt(key, params)` 取用）+ `ai/prompts.ts` **组装层**（只填占位符）。
+- `ai/tasks.ts` 各任务「调用+解析」（顶部 `requireList()` 是严格取列表出口）；`buildUpdateProposal()`（单条扩写与批量打磨
+  **共用**）与 `relationProposals()` 是公共底座；`ai/parse.ts`；`ai/consist.ts` 账本。
+- `storage/indexeddb.ts`（顶部注释记 open/升级阻塞的坑，改前先读）；`lib/diagLog.ts`；`state/store.tsx`（全局状态 +
+  落库默认值 + 操作日志与撤销）。
+- `state/aiTasks.ts`（模块级任务表，`useSyncExternalStore`）；`state/jobQueue.ts`；`aiGuardKey(ai)` 是
+  **AI 配置齐没齐的唯一判据**（三处共用）。`components/TaskDock.tsx` 右下角胶囊（挂 `Shell`、切页不丢）。
+- `state/useAgent.ts` 执行循环；`ai/agent/` 三件套 `tools.ts`（**唯一写库入口** + `AgentTool.args`）/`protocol.ts`/`prompts.ts`。
+- `pages/GraphPage.tsx` 三支视图：`relations`（关系图）/`time`（`components/TimeAxis.tsx` 点轴）/`chronicle`
+  （`components/ChronicleView.tsx` 编年）；**`GraphView` 类型与 `view` 状态在 `App.graphView`**
+  （`applyView` 有白名单，**加视图要同时改它**）。`types.ts`：`ReviewItem.batchId?` 是「同批归组」的唯一依据。
+- **`components/MarkdownView.tsx`：`#` 留给了页面标题**（`level = Math.min(h[1].length + 1, 6)`）→ 正文的 `## 概览`
+  落成 **`<h3>`**。**`.page-desc` 是纯文本**（不渲染 Markdown）→ 文案里别写 `**加粗**`，会原样露出来。
+- `lib/wiki.ts`（陈列层纯函数：摘录/筛选/**稳定排序**/牵连数/双向关联/来源/内链目标）；`lib/markdown.ts` 的 `outlineOf()`
+  只认 ATX（**不认 setext**）。
+- **Wiki 一页三支**（`WikiView = 'display'|'entries'|'pieces'` + `#entries`/`#pieces` 别名）；`EntriesPage`/`PiecesPage` 以
+  `embedded` 嵌入（**不重复页标题、但按钮与 `data-role` 一个不动**）。
+- **Wiki 的「阅读」支 = 三栏百科版式**（左目录/中正文/右信息栏），不是卡片墙。左 `.wk-nav` **按分类分组**，排序只决定
+  **组内**先后；`.wk-infobox` **不再是 Modal**；`shown = reading ?? list[0].id`；点目录 push `trail`。
+- **杂物间才是瀑布流**：`.pz-grid` 用 CSS 多列（`column-width` + `break-inside: avoid`），**不是 grid**；阅读顺序按列
+  → **排序必须稳定**。
+- `StatusPill` 渲染成 `<span class="pill {status}">`，**没有 `data-status`**（那个钩子在 `wiki-nav-item` 上）。
+- 正文编辑器那一路见 §9。
+
+### 8.1 编年（`components/ChronicleView.tsx` + `components/useTimelineLayout.ts`）
+
+- **四层读法**（纪元带 / 卡片墙 / 甘特轨 / 刻度尺）**共用同一套 x** 与同一个横向滚动条。任何一层单独改坐标系
+  = 这一页就废了。**唯一例外**：卡片为了不重叠会就地让位（见下），所以「卡片中心 = 精确位置」只在没铺开时成立 —
+  精确位置一律看甘特轨（`railLeftOf` 用真实中心 `p.x`，卡片用 `p.left`，两者挤的那一小段会差开）。
+- **卡片绝不重叠**（作者点名的硬要求，原话「最好都并上，像历史博物馆里的时间线那样」）。
+  摆位 = `placed`：先按理想位置**分簇**（判据是**理想矩形相交**，不做近似），簇内**紧贴铺开**、
+  锚在**首尾两张理想中心的中点**上，再往后让一下保证不越过前一簇；`pushed` 记「被挪了几张」，
+  **图例必须如实报数**（`chron-pushed`）。**不许回到「宁可重叠也不挪」** —— 叠起来读不出「底下压着几张」。
+- **轴宽**：`inner = clamp(desired, 容器宽, max(容器宽, natural))`；`natural` = 均匀 `(n-1)×最挤的一对`、
+  比例 `Σ卡宽 + (n-1)×GAP`，**`GAP = 0`**（卡片并成一条带）。到顶就不再撑，剩下的交给铺开。
+  **画布宽还必须跟 `placed.right` 取大值** —— 铺开是在坐标里做位移，最右一簇会探出内区，不给地方就被裁掉半张。
+- **刻度尺按轴的实际长度定疏密**：`raw = span×260/inner` → 取 1/2/5×10^k 的整齐步长（固定五根时一屏只看得到一根）。
+  刻度线**贯穿轨道**（`.chron-gridline`）：区间按行摆，可见的行常常只有一两条，没有网格就是一大片空白。
+- **墙是墙，不是一摞卡片**：卡片**底色与墙相同**（`transparent`）、无圆角无投影，只靠 `border-left` 一根发丝线分栏
+  （挨着时是中缝，拉开时是下一栏的起头）；hover / sel 只加**一层极淡的影**，**不许位移**（横坐标有意义）。
+- **这一页只有一个块**（作者原话：「最右侧的编年卡片不符合这个风格……和总体的布局都有些割裂」）：
+  `ChronicleView` 外面是 `.chron-sheet`（左 `.chron-main` 展墙 / 右 `.chron-side` 注记栏），
+  **同一个底色、`align-items: stretch` 同高**（栏线通到底），中间只一根发丝线；右栏里
+  **一条边框/圆角/投影都不要**（`[data-role=chron-brief]` / `chron-pool` / `chron-panel` 都是 `.chron-note`），
+  分小节靠 `.chron-note-head`（11.5px + 字距 + `--text-dim`）的层级；池子行改成平铺 + 发丝线
+  （只覆盖 `.chron-side .tl-pool-*`，**`.tl-pool-*` 是两视图共用的，不许改基类**）。
+- **字体不许压过版式**（作者原话：「字体过大，有种头重脚轻的，要适量留白」）：卡片标题 `TITLE_SIZE` =
+  **21 / 18 / 16**（原 27/21/17），腾出来的地方给留白 —— 卡内边距 20/22/18、摘要 12.5px/1.8、
+  标题上边距 12、卡脚 `padding-top` 14。**层级靠「谁最大」而不是「谁很大」**。
+- **纪元带的色段首尾相接、铺满整条轴**（`eraSpans`）：纪元本来就是彼此接着的，
+  分界取「上一段最后一张卡」与「这一段第一张卡」的中点；`setLast.x2 = W`、第一段 `x1 = 0`。
+  色线用 `margin-bottom: -1px` **压在墙沿那根发丝线上**（`.chron-era` 要 `z-index: 2`，否则被后画的墙盖住）。
+  **曾用「首尾条目的中心」**（当时卡片会互相压着，按边缘取值会重叠）；现在卡片绝不重叠，按边缘才铺得满。
+- **「看法」不许待在正文上方**：工具条在**画布下面**（`.chron-footbar`），常显只有三个动作（新建 / AI 排版 / 显示）、
+  默认 `opacity: .55`；比例 / 均匀、只看重大、疏密、重置收进「显示」浮层（`.chron-more`；
+  **浮层开着时父级要加 `.open` 恢复满不透明**，否则整块浮层跟着被压暗）。
+- **「什么时候」独立一行**（`● 分量 · 形态` / `🕐 时间 / 宋体标题 / 摘要 / 分类`）：挤在眉标里时窄卡片会把它压成
+  「一…」「前潮纪…」，而这一页最不该被截的就是时间。
+- **宋体只在 16px 以上的标题/纪元名上用**（`--serif` 栈，Windows 落到 `SimSun`）；正文一概不用它。
+- **`useTimelineLayout` 是「AI 自动排版」唯一的一份实现**（两支配法共用）：入队 → **读按入队那刻、写打在当下那份库**、
+  落库前**逐条对账** → 结果进**审查队列**（`kind: 'timeline-layout'`），不直接落库。
+- **新增 CSS 类名先 `grep` 一遍**：编年工具栏曾叫 `chron-bar`（与甘特轨区间条同名）→ 静默套上「绝对定位 + 9px 高 +
+  裁溢出」，整条工具栏被压成一条线、按钮全裁掉，而截图看着像「字叠在一起」。
+- **按截图判断版式不可靠**：缩小后的截图会把两块挨得近的文字看成「叠住了」。要用 `getBoundingClientRect` 实测，
+  「谁压住谁」的「包含」判据只能按 **DOM 父子关系**（矩形套住 ≠ 父子 —— 曾因此放过「横幅整条盖住工具栏」）。
+  断言：`.dev/e2e-chronicle.mjs`（38 项）+ `.dev/shot-chron.mjs` 的**版式自检**（不通过就退出码 1）。
+- **截图脚本的坑**：`getBoundingClientRect` **不管滚动容器的裁切** —— 这条轴四五千像素，不先 `scrollLeft` 滚过去
+  就裁，拿到的是一片空白加右边面板（看着像页面坏了）。放大细节用 `clip` + `captureBeyondViewport`，**别缩视口**
+  （缩了会横向溢出、右边一律被切，是自己造的假象）。**`captureBeyondViewport: true` 是必须的**：少了它会
+  把圆角块（页头那颗 chip）当另一个图层、以错位坐标合成进图 → 图上多出一块「不在 DOM 里」的蓝块
+  （`elementsFromPoint` 在那个点谁也找不到）。另外 **Read 看图会按内容去重**：同一张整页图看第二遍不会重画，
+  要评细节就用 `.dev/crop.py` 裁一块新的。
+- **别拿视口坐标跟宽度比**：`getBoundingClientRect` 给的是**视口坐标**，`spanTo` 与 `canvas.width` 差着一个
+  左沿偏移（左边有侧栏）—— e2e 里曾因此误报「纪元色段没铺满」。
+
+## 9. 正文编辑器（「写」的那一半）
+
+`WikiPage` 的「编辑」支 → `EntriesPage` → `EntryEditor.tsx`（外壳：四个页签、分栏预览、编辑摘要、草稿）→
+`WikiEditor.tsx`（正文编辑器）。纯函数层 `lib/wikitext.ts`。
+
+- **底色是真的 `<textarea>`**，不是 contenteditable（后者会丢输入法、原生撤销栈、选区、拖拽选词、无障碍）。上色只**盖在底下
+  一层彩色副本**，文字仍由 textarea 提供（它 `color: transparent`）。
+- **两层对齐的三个死条件**：①字体度量一致 —— 共用**同一个 class**（`.wxe-font`）；②换行规则一致（`pre-wrap` + `break-word`）；
+  ③盒模型一致（边框与内边距一样，副本那层边框透明只为占位）。
+- **上色纪律：副本里只许改 `color`/`background`/`text-decoration`。** 加 `font-weight`/`font-style` 会让那段字更宽 →
+  副本自己先折行 → 从那一行往下全错开（看着非常像「字体没加载好」）。
+- **输入法组字期间必须把文字颜色还回去**并隐藏副本（`.wxe-stage.composing`）。
+- **`highlightMarkdown` 的硬约束：段拼起来逐字符等于原文**（含换行）；段上带 `line`，章节跳转靠它。
+- **行内扫描器不能「没匹配就收工」**（用粘性正则 `y` 逐格推进，别用 `.replace()` 链）。
+- **工具栏动作的「族」由纯函数层统一 export**（`PREFIX_MARK`：无序与有序**共用一个 mark**）；**缩进单独算**；
+  `specOf(key)` 要**按 key 取工具**而不是按下标。
+- **内链候选「一个都不匹配」时要说话**（`wxe-suggest-none`），但「刚打完 `[[` 一个字没写」时不吭声；候选里排掉自己；
+  面板用 `onMouseDown`（`onClick` 会先让输入框失焦）。
+- **编辑摘要的落点是 `logOp.detail`**（`updateEntry(id, patch, detail?)` 第三个参数），不给 `Entry` 加字段。
+- **草稿三条纪律**：①存 localStorage 不进库；②重开时**不自动套用**（摆「恢复/丢弃」）；③关闭前 confirm 要写清
+  「取消 = 草稿留着」。`dirty` 才写、防抖 700ms。
+- **三态模式（`edit`/`split`/`preview`）记进 localStorage**；预览层与阅读页**共用 `<MarkdownView className="wiki">`**。
+- **React 18 写 textarea/input 的 ref 别用 `useRef<T | null>(null)`**（会命中重载使 `| null` 套两层 → TS2322）；
+  写 `useRef<T>(null)`，属性类型写 `React.RefObject<T>`。
+
+## 10. 验证工具与环境坑（`.dev/`，不参与构建）
+
+- `i18n-coverage.mjs` 静态扫硬编码文案；`sweep.mjs` 全页巡检（16 页）；`shot.mjs` 单页截图；
+  `shot-chron.mjs` 编年演示数据 + 截图 + **版式自检**（含 AI 排版链路验证）。
+- 单测：`unit-prompts`(21) / `unit-parse`(30) / `unit-consist`(31，含一条**故意反向**的断言) / `unit-args`(61) /
+  `unit-agent-protocol`(56，**只有它能盯「模型没照格式回」**) / `unit-agent-prompt`(4) / `unit-ai-config`(106) /
+  `unit-wiki`(64) / `unit-wikitext`(84) / `unit-probe`(62)。
+- e2e：`e2e-i18n` / `e2e-onboarding`（**不带** `--cors`）/ `e2e-pieces`(11) / `e2e-docs`(17) / `e2e-blocked-db`(9) /
+  `e2e-timeout-db`(15) / `e2e-graph`(58) / `e2e-wiki`(58) / `e2e-wiki-edit`(63) / `e2e-studio-agent`(126) /
+  `e2e-timeline`(135) / `e2e-ai-bg`(16) / `e2e-consist`(77) / `e2e-queue`(34) / `e2e-polish`(46) /
+  `e2e-agent-args`(22) / `e2e-ob-suggest`(12) / `e2e-ai-config`(58，两种启动参数各一次) / `e2e-model-probe`(52)。
+- **截图/演示脚本的三条纪律**：①**不写死版本号**（用不带版本号的 `open()`）；②
+  `Page.addScriptToEvaluateOnNewDocument` **每次导航都重跑** → 顺序必须是「先让应用自己建库 → `evaluate(SEED)` →
+  `Page.reload`」；③**要放大看细节就用 `clip` 裁切，别缩视口**（缩视口会让宽屏应用横向溢出、截出来像布局坏了），
+  且 **`clip` 必须配 `captureBeyondViewport: true`**（否则会画出不在 DOM 里的色块伪影）。
+- `e2e-blocked-db.mjs` 顶部 `DB_VERSION` 与 `src/storage/indexeddb.ts` 同步；读 store 清单**必须用不带版本号的 `open()`**。
+- **`unit-*.mjs` 开头的 `rmSync(OUT)` 必须吞错**（safe-delete 拒删时脚本第一行当场死，看着像「单测全崩」其实一条没跑）。
+- **safe-delete 额度按回合累计** → **「先跑单测、再构建」会翻车**。
+- 单测脚本 `tsc` 参数不同 → **源码别依赖只有 `--strict` 才成立的类型收窄**；批量跑单测 grep 要宽。
+- `e2e-timeout-db.mjs` 的「看到 worldforge@v1」偶发失败（3s 超时），重跑即过。
+- **Bash 工具会拦端口绑定**（WinError 10013）→ 起服务要 `dangerouslyDisableSandbox: true`。
+
